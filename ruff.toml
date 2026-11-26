@@ -1,0 +1,182 @@
+# ==============================================================================
+# Global Settings
+# ==============================================================================
+target-version = "py312" # Set your minimum Python version
+line-length = 120        # Standard modern line length (often chosen between 88 and 120)
+show-fixes = true        # Explain what was automatically fixed
+
+# Files and directories to exclude from analysis
+extend-exclude = [
+    "__pycache__",
+    ".git",    
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".venv",
+    ".bat",
+    ".sh",    
+    "venv",
+    "build",
+    "dist",
+    "docs",
+    "notebooks",
+    "spreadsheets"
+]
+
+# ==============================================================================
+# Linting Configuration
+# ==============================================================================
+[lint]
+# Preview mode enables experimental rules (set to false if you want strict stability)
+preview = true
+
+# Fix violations automatically when `--fix` is passed (unless in `unfixable`)
+fixable = ["ALL"]
+unfixable = [
+    "unused-variable", # Do not automatically remove unused variables (safer to do manually)
+]
+
+# All rules to enforce
+select = [
+    "F",    # Pyflakes (syntax, undefined names)
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "C90",  # mccabe (code complexity)
+    "I",    # isort (import sorting ordering)
+    "N",    # pep8-naming (naming conventions)
+    "D",    # pydocstyle (docstring compliance)
+    "DOC",  # pydoclint: Checks that parameters/returns match the function signature
+    "UP",   # pyupgrade (modernizes old Python syntax)
+    "YTT",  # flake8-2020 (misuse of sys.version)
+    "ASYNC",# flake8-async (asyncio code anti-patterns)
+    "S",    # flake8-bandit (security checks)
+    "BLE",  # flake8-blind-except (catches bare except)
+    "FBT",  # flake8-boolean-trap (avoids boolean positional arguments)
+    "B",    # flake8-bugbear (common bugs and design flaws)
+    "A",    # flake8-builtins (shadowing builtins)
+    "COM",  # flake8-commas (trailing commas consistency)
+    "C4",   # flake8-comprehensions (efficient list/dict manipulation)
+    "T10",  # flake8-debugger (detects breakpoint/pdb calls)
+    "FA",   # flake8-future-annotations (from __future__ import annotations)
+    "ISC",  # flake8-implicit-str-concat (accidental string concatenation)
+    "G",    # flake8-logging-format (efficient logging formatting)
+    "INP",  # flake8-no-pep420 (implicit namespace packages)
+    "PIE",  # flake8-pie (misc lint rules)
+    "T20",  # flake8-print (forbids print statements in production code)
+    "PYI",  # flake8-pyi (stub files checking)
+    "PT",   # flake8-pytest-style (pytest best practices)
+    "RSE",  # flake8-raise (clean exception raising syntax)
+    "RET",  # flake8-return (checks return statement logic)
+    "SIM",  # flake8-simplify (simplifies complex expressions)
+    "TID",  # flake8-tidy-imports (ban specific imports/modules)
+    "TC",  # flake8-type-checking (manages type-checking imports)
+    "ARG",  # flake8-unused-arguments (detects unused function arguments)
+    "PTH",  # flake8-use-pathlib (prefers pathlib over os.path)
+    "ERA",  # eradicate (detects commented-out code)
+    "PL",   # Pylint (refactoring, convention, error, warning categories)
+    "TRY",  # tryceratops (try/except code anti-patterns)
+    "FLY",  # flynt (f-strings upgrades)
+    "NPY",  # NumPy-specific rules (NPY002 bans legacy global np.random API)
+    "RUF",  # Ruff-specific rules
+]
+
+# Rules to ignore globally
+ignore = [
+    "incorrect-blank-line-before-class",   # 1 blank line required before class docstring (conflicts with D211)
+    "multi-line-summary-second-line",   # Multi-line docstring summary should start at the second line (conflicts with D212)
+    "missing-trailing-comma", # Trailing comma missing (conflicts with ruff format)
+    "single-line-implicit-string-concatenation", # Implicit string concatenation (conflicts with ruff format)
+    # --- Project-level intentional exemptions ---
+    "blind-except", # except Exception is the explicit resilience pattern (AGENTS.md §4.2)
+    "typing-only-first-party-import",  # Type-checking import blocks are optional; from __future__ import annotations handles it
+    "typing-only-third-party-import",  # Same as TC001 for third-party
+    "typing-only-standard-library-import",  # Same for stdlib
+    "undocumented-public-init",   # __init__ docstrings optional when class docstring is sufficient
+    "import-outside-top-level",# Deferred imports inside functions are intentional (startup perf, circular-dep avoidance)
+    "try-consider-else", # return-in-try is the explicit resilience pattern (AGENTS.md §4.2)
+    "raise-vanilla-args", # Long exception messages are acceptable
+    "raw-string-in-exception",  # String in exception raise is fine
+    "f-string-in-exception",  # f-string in exception raise is fine
+    "boolean-type-hint-positional-argument", # Boolean positional args used in Typer CLI (by design)
+    "boolean-default-value-positional-argument", # Boolean default in function definition used in config
+    "mutable-class-default", # ClassVar mutable default is handled by pydantic
+    "missing-return-type-public-function", # Return type for simple Flask/FastAPI endpoint functions
+    "missing-return-type-private-function", # Return type for simple inner functions
+    "missing-type-function-argument", # Missing type for decorator inner functions
+    "boolean-positional-value-in-call", # Boolean positional value in Typer Option/Argument calls (by design)
+    "function-call-in-default-argument",   # typer.Argument/Option in defaults is the canonical Typer CLI pattern
+    "hardcoded-bind-all-interfaces",   # 0.0.0.0 binding is intentional in server defaults (CLI exposes --host)
+    "hardcoded-password-string",   # Default placeholder "CHANGE_ME_IN_PRODUCTION" is not a real credential
+    "non-pep695-generic-function",  # type-parameter syntax requires Python 3.12; keep TypeVar for compat
+    "too-many-arguments",# CLI commands and API handlers legitimately exceed 5 args
+    "too-many-positional-arguments",# Same as PLR0913
+    "too-many-statements",# Flask/FastAPI factory functions are long by nature
+    "too-many-locals",# Ingestion pipeline has many local vars by design
+    "no-self-use",# Static-method enforcement is overly strict for class-method grouping
+    "complex-structure",   # Flask/FastAPI factory functions exceed McCabe 10; acceptable
+    "magic-value-comparison",# Magic constants are readable in context (300 chars, 45 = 0+1+…+9)
+    "ambiguous-unicode-character-docstring", # EN-DASH in docstrings is valid Unicode prose
+    "ambiguous-unicode-character-comment", # EN-DASH in comments is valid Unicode prose
+    "docstring-missing-returns", # Returns sections optional for trivial utility functions
+    "docstring-missing-exception", # Raises sections optional; prefer not to duplicate RuntimeError in all callers
+    "undocumented-public-method",   # Public method docstrings optional in test classes
+    "undocumented-public-package",   # Package-level docstrings optional for test packages
+    "suppressible-exception", # contextlib.suppress can obscure intent; bare try-except-pass is clearer
+    "try-except-pass",   # try-except-pass for benign parse failures is intentional
+    "if-else-block-instead-of-if-exp", # Ternary vs if-else is a style call; readability favours if-else here
+    "unnecessary-assign", # Intermediate assignment aids debuggability; not a real issue
+    "import-private-name",# Private imports from own module in tests are acceptable
+    "escape-sequence-in-docstring",   # r-prefix for backslash docstrings — not required in Google style
+]
+
+
+# Allow specific rules to fail on certain file patterns
+[lint.per-file-ignores]
+"__init__.py" = ["unused-import", "undefined-local-with-import-star"] # Allow unused imports and star imports in init files
+"tests/**/*.py" = [
+    "pytest-unittest-assertion",  # unittest.TestCase assertion methods (assertEqual, assertIn, etc.)
+    "pytest-unittest-raises-assertion",  # assertRaises allowed in unittest.TestCase
+    "assert",   # Allow assert statements in tests
+    "hardcoded-password-string",   # Allow hardcoded passwords/tokens in test files
+    "hardcoded-password-func-arg",   # Allow hardcoded password arguments in test setup
+    "hardcoded-temp-file",   # Allow /tmp paths in test fixtures
+    "unused-function-argument", # Allow unused arguments in test functions (fixtures)
+    "unused-method-argument", # Allow unused arguments in test methods (@patch injected mocks)
+    "undocumented-public-class",   # Test class docstrings optional
+    "undocumented-public-method",   # Test method docstrings optional
+    "undocumented-public-function",   # Test function/fixture docstrings optional
+    "undocumented-public-package",   # Test package __init__ docstrings optional
+    "assert-raises-exception",   # pytest.raises(Exception) is acceptable when testing frozen model mutation
+    "pytest-raises-too-broad",  # pytest.raises without match is acceptable for pydantic validation tests
+    "commented-out-code", # Comment labels in parametrize lists look like commented-out code to ERA
+    "pytest-parametrize-names-wrong-type",  # Parametrize string vs tuple style is a project convention
+]
+
+# ==============================================================================
+# Specific Plugin Configurations
+# ==============================================================================
+[lint.mccabe]
+max-complexity = 10 # Flag functions with high cyclomatic complexity
+
+[lint.pydoclint]
+ignore-one-line-docstrings = true
+
+[lint.pydocstyle]
+convention = "google" #
+
+[lint.isort]
+combine-as-imports = true
+split-on-trailing-comma = false
+known-first-party = ["llmopenfinance"]
+
+[lint.flake8-tidy-imports]
+ban-relative-imports = "all" # Enforce absolute imports for clarity
+
+# ==============================================================================
+# Code Formatter Configuration
+# ==============================================================================
+[format]
+quote-style = "double"            # Use double quotes for strings (like Black)
+indent-style = "space"            # Indent using spaces
+skip-magic-trailing-comma = false # Respect trailing commas for formatting layouts
+line-ending = "auto"              # Detect line endings automatically
