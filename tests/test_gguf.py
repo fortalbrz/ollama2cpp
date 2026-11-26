@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from ollama2cpp import gguf
 from ollama2cpp.gguf import GgufError, GgufInfo, head_dim, kv_cache_bytes, read_gguf
 from tests.gguf_builder import T_ARRAY, T_STRING, pack_header, pack_kv, pack_string, write_gguf
 
@@ -107,11 +108,29 @@ def test_string_array_with_strings_larger_than_read_buffer(tmp_path: Path) -> No
     assert (info.block_count, info.file_type) == (4, 2)
 
 
-def test_truncated_string_array(tmp_path: Path) -> None:
-    data = pack_header([pack_kv("tokenizer.ggml.tokens", ["abc"] * 100), *_core()])
-    for cut in (60, 61, 70, 200):
+def test_every_truncation_of_a_string_array_file_raises_gguf_error(tmp_path: Path) -> None:
+    long_tokens = ["abc", "", "de" * 10, "f"] * 5
+    blobs = [pack_kv("tokenizer.ggml.tokens", long_tokens), *_core(), pack_kv("general.file_type", 2)]
+    data = pack_header(blobs)
+    assert read_gguf(_raw(tmp_path, data)).file_type == 2
+    for cut in range(len(data)):
         with pytest.raises(GgufError):
             read_gguf(_raw(tmp_path, data[:cut]))
+
+
+def test_every_truncation_with_tiny_read_buffer(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(gguf, "_CHUNK", 16)
+    data = pack_header([pack_kv("tokenizer.ggml.tokens", ["abc", "de" * 10, "f"] * 5), *_core()])
+    assert read_gguf(_raw(tmp_path, data)).block_count == 4
+    for cut in range(len(data)):
+        with pytest.raises(GgufError):
+            read_gguf(_raw(tmp_path, data[:cut]))
+
+
+def test_string_longer_than_cap_but_within_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(gguf, "_MAX_STRING_BYTES", 16)
+    with pytest.raises(GgufError, match="limit"):
+        read_gguf(_raw(tmp_path, pack_header([pack_kv("general.name", "x" * 64), *_core()])))
 
 
 def test_string_array_ending_the_file(tmp_path: Path) -> None:

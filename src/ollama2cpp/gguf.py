@@ -26,6 +26,7 @@ _T_ARRAY = 9
 _MAX_DEPTH = 4
 _MAX_KEPT_ARRAY = 4096  # per-layer arrays are far shorter than this
 _CHUNK = 1 << 20
+_MAX_STRING_BYTES = 64 << 20  # no real metadata string (chat template, name) is anywhere near this
 _U64 = struct.Struct("<Q")
 _MIN_KV_BYTES = 12  # key length (8) + value type (4)
 
@@ -136,9 +137,12 @@ class _Reader:
             The decoded string.
 
         Raises:
-            GgufError: On absurd length, truncation or invalid UTF-8.
+            GgufError: On a length above the cap, truncation or invalid UTF-8.
         """
-        raw = self.read(self.unpack("<Q"))
+        length = self.unpack("<Q")
+        if length > _MAX_STRING_BYTES:
+            raise GgufError(f"GGUF string of {length} bytes exceeds the {_MAX_STRING_BYTES} byte limit")
+        raw = self.read(length)
         try:
             return raw.decode("utf-8")
         except UnicodeDecodeError as exc:
@@ -153,7 +157,6 @@ class _Reader:
         Raises:
             GgufError: If a string runs past the end of the file.
         """
-        # The caller has checked count * 8 <= remaining, so every refill holds at least one length prefix.
         fh = self._fh
         buf = b""
         off = 0
@@ -163,6 +166,8 @@ class _Reader:
                 fh.seek(off - len(buf), 1)  # drop the unread tail of the buffer
                 buf = fh.read(_CHUNK)
                 off = 0
+                if len(buf) < _U64.size:
+                    raise GgufError("truncated GGUF file")
             end = off + _U64.size + _U64.unpack_from(buf, off)[0]
             done += 1
             if end <= len(buf):
