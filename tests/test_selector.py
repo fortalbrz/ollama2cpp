@@ -205,3 +205,35 @@ def test_embedding_never_chosen_even_if_largest(fake_ollama: Builder) -> None:
     best = choose_best(classify_all(models), 100_000)
     assert best is not None
     assert best[0].model.name == "chat:latest"
+
+
+@pytest.mark.parametrize("name", ["lfm3-audio", "Whisper-large", "kokoro-tts", "my-speech-model"])
+def test_audio_names_unsupported(fake_ollama: Builder, name: str) -> None:
+    (model,) = _models(fake_ollama, [_chat(name, GB)])
+    cand = classify(model)
+    assert cand.kind == "unsupported"
+    assert "audio model" in cand.reason
+
+
+def test_audio_model_not_chosen_even_if_smaller_and_fits(fake_ollama: Builder) -> None:
+    models = _models(fake_ollama, [_chat("tiny-audio", GB), _chat("chat", 6 * GB)])
+    best = choose_best(classify_all(models), BUDGET_8GB)
+    assert best is not None
+    assert best[0].model.name == "chat:latest"
+
+
+def test_non_llm_whisper_arch_unsupported(fake_ollama: Builder) -> None:
+    (model,) = _models(fake_ollama, [_chat("stt", GB, arch="whisper")])
+    cand = classify(model)
+    assert cand.kind == "unsupported"
+    assert "whisper" in cand.reason
+
+
+def test_embedding_audio_name_is_embedding(fake_ollama: Builder) -> None:
+    (model,) = _models(fake_ollama, [_chat("audio-embed", GB)])
+    assert classify(model).kind == "embedding"
+
+
+def test_only_audio_model_returns_none(fake_ollama: Builder) -> None:
+    models = _models(fake_ollama, [_chat("lfm3-audio", GB)])
+    assert choose_best(classify_all(models), 100_000) is None

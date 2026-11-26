@@ -23,7 +23,14 @@ log = logging.getLogger(__name__)
 
 HEADROOM_FACTOR = 1.10  # compute buffers and fragmentation on top of weights + KV cache
 OVERHEAD_MIB = 512  # fixed runtime overhead (CUDA/Vulkan context, scratch buffers)
-NON_LLM_ARCHITECTURES = frozenset({"clip", "mmproj"})  # projector-only GGUFs are never chat models
+# GGUF ``general.architecture`` values that are not text LLMs and so are never chat candidates:
+#   clip    - vision/projector encoders (CLIP, multimodal projector GGUFs)
+#   mmproj  - llama.cpp's name for multimodal projector files
+#   whisper - speech-to-text models
+# The real store's audio model (lfm3-audio) reports the text backbone arch ``lfm3``, so it is caught by name instead.
+NON_LLM_ARCHITECTURES = frozenset({"clip", "mmproj", "whisper"})
+# Case-insensitive model-name substrings marking speech/audio models that llama-server cannot serve as text chat.
+NON_TEXT_NAME_PATTERNS = ("audio", "whisper", "tts", "speech")
 _MIB = 1024 * 1024
 
 Kind = Literal["chat", "embedding", "unsupported"]
@@ -45,8 +52,11 @@ def _unsupported(model: OllamaModel, reason: str, info: GgufInfo | None = None) 
     return Candidate(model, info, "unsupported", 0, reason)
 
 
-def _need_mib(model: OllamaModel, info: GgufInfo, ctx: int) -> int:
+def estimate_need_mib(model: OllamaModel, info: GgufInfo, ctx: int) -> int:
     """Estimate the memory needed to run ``model`` at ``ctx`` tokens.
+
+    Known limitation: the KV-cache term ignores sliding-window attention, so it over-estimates such models (the
+    selector is conservative; ``choose_best`` falls back to the smallest chat model with ``fits=False``).
 
     Args:
         model: The installed model (its manifest size is the weight size).
@@ -67,11 +77,15 @@ def _classify(model: OllamaModel, ctx: int) -> Candidate:
     if not model.blob_exists:
         return _unsupported(model, "missing blob")
     info = read_gguf(model.blob_path)
+    need = estimate_need_mib(model, info, ctx)
+    name = model.name.lower()
+    if info.is_embedding or "embed" in name:  # embedding wins over the non-text rules below
+        return Candidate(model, info, "embedding", need)
     if info.architecture in NON_LLM_ARCHITECTURES:
-        return _unsupported(model, f"non-LLM architecture {info.architecture!r}", info)
-    need = _need_mib(model, info, ctx)
-    kind: Kind = "embedding" if info.is_embedding or "embed" in model.name.lower() else "chat"
-    return Candidate(model, info, kind, need)
+        return _unsupported(model, f"non-LLM architecture {info.architecture!r} (not a text chat model)", info)
+    if any(pattern in name for pattern in NON_TEXT_NAME_PATTERNS):
+        return _unsupported(model, "audio model (not a text chat model)", info)
+    return Candidate(model, info, "chat", need)
 
 
 def classify(model: OllamaModel, ctx: int = DEFAULT_CTX) -> Candidate:
