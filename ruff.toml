@@ -167,7 +167,7 @@ convention = "google" #
 [lint.isort]
 combine-as-imports = true
 split-on-trailing-comma = false
-known-first-party = ["llmopenfinance"]
+known-first-party = ["ollama2cpp"]
 
 [lint.flake8-tidy-imports]
 ban-relative-imports = "all" # Enforce absolute imports for clarity

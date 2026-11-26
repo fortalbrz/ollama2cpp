@@ -5,12 +5,11 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "ollama2cpp"
 version = "0.1.1"
-description = "Console app to start llammacpp from ollama available models"
-readme = "README.md"
+description = "Console app to start llama.cpp (llama-server) from Ollama available models"
 requires-python = ">=3.12"
 authors = [{ name = "Jorge Albuquerque" }]
 license = { text = "MIT" }
-keywords = ["open finance", "pluggy", "llm", "ollama", "claude", "duckdb", "personal finance"]
+keywords = ["llm", "ollama", "llama.cpp", "llama-server", "gguf"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Environment :: Console",
@@ -18,6 +17,7 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
 ]
 dependencies = [
+    "psutil>=7",
     "rich>=15.0.0",
     "typer>=0.29.2",
 ]
@@ -34,10 +34,10 @@ packages = ["ollama2cpp"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
-addopts = "-v --strict-markers --cov=src/llmopenfinance --cov-report=term-missing --cov-fail-under=90"
+addopts = "-v --strict-markers --cov=src/ollama2cpp --cov-report=term-missing --cov-fail-under=90"
 markers = [
     "slow: marks tests as slow",
-    "live: hits real external services (Pluggy / Claude / Ollama); deselected by default",
+    "live: hits real external services (Ollama / llama-server); deselected by default",
 ]
 
 [tool.coverage.run]
