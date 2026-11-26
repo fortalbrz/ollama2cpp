@@ -40,7 +40,9 @@ def fake_ollama(tmp_path: Path) -> Callable[..., Path]:
     invalid JSON), and returns the store root. It can be called repeatedly to add more models.
 
     Recognised ``options`` keys: ``projector`` / ``draft`` (bool, add the layer), ``no_model`` (bool, omit the model
-    layer), ``registry`` and ``namespace`` (override the default ``registry.ollama.ai`` / ``library``).
+    layer), ``registry`` and ``namespace`` (override the default ``registry.ollama.ai`` / ``library``), and
+    ``blob_writer`` (a ``Callable[[Path], object]`` that writes the model-layer blob instead of the default 16-byte
+    stub, e.g. a small valid GGUF while the manifest declares gigabytes).
 
     Blob files are tiny; the declared size lives only in the manifest.
 
@@ -83,8 +85,13 @@ def fake_ollama(tmp_path: Path) -> Callable[..., Path]:
             path.write_text(json.dumps(manifest), encoding="utf-8")
             if f"{name}:{tag}" in missing:
                 continue
+            blob_writer = options.get("blob_writer")
             for layer in layers:
-                (blobs / layer["digest"].replace(":", "-")).write_bytes(b"GGUF" + b"\0" * 12)
+                target = blobs / layer["digest"].replace(":", "-")
+                if blob_writer is not None and layer["mediaType"].endswith("image.model"):
+                    blob_writer(target)
+                else:
+                    target.write_bytes(b"GGUF" + b"\0" * 12)
         for name, tag in corrupt:
             path = root / "manifests" / DEFAULT_REGISTRY / DEFAULT_NAMESPACE / name / tag
             path.parent.mkdir(parents=True, exist_ok=True)
