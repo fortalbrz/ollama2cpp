@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from pathlib import Path
 
@@ -165,3 +166,13 @@ def test_env_home_redirects_load_and_save(tmp_path: Path, monkeypatch: pytest.Mo
     loaded = load()
     assert loaded is not None
     assert loaded.ollama_path == "E"
+
+
+def test_corrupt_config_warning_has_no_traceback(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    (tmp_path / "config.json").write_text("{bad", encoding="utf-8")
+    with caplog.at_level(logging.DEBUG, logger="ollama2cpp.config"):
+        assert load(tmp_path) is None
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert warnings
+    assert all(r.exc_info is None for r in warnings)
+    assert any(r.levelno == logging.DEBUG and r.exc_info for r in caplog.records)

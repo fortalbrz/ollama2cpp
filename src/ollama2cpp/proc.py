@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import shlex
 import subprocess  # ruff: ignore[suspicious-subprocess-import]
 import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-__all__ = ["Handle", "ProcResult", "run", "spawn"]
+__all__ = ["Handle", "ProcResult", "format_command", "run", "spawn"]
 
 Handle = subprocess.Popen[str]  # running-process handle, re-exported so other modules need not import subprocess
 
@@ -113,3 +114,17 @@ def spawn(argv: Sequence[str], *, log_path: Path | None = None, detach: bool = F
     finally:
         if log_file is not None:
             log_file.close()
+
+
+def format_command(argv: Sequence[str]) -> str:
+    """Render ``argv`` as a copy-pasteable command line for the host shell.
+
+    Args:
+        argv: Command and arguments.
+
+    Returns:
+        str: Windows quoting (``list2cmdline``) on Windows, POSIX quoting (``shlex.join``) elsewhere.
+    """
+    if sys.platform == "win32":
+        return subprocess.list2cmdline(list(argv))
+    return shlex.join(argv)

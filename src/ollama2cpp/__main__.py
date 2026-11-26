@@ -8,13 +8,17 @@ from __future__ import annotations
 
 import logging
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Annotated
 
 import typer
 
-from ollama2cpp import __version__, ui
+from ollama2cpp import __version__, ui, workflow
 from ollama2cpp.constants import ENV_OLLAMA_MODEL
+from ollama2cpp.llamacpp import LlamaCppError
+from ollama2cpp.ollama import ModelNotFoundError
 
 logger = logging.getLogger(__name__)
 __all__ = ["app", "main"]
@@ -62,8 +66,77 @@ def _configure(
         format="%(levelname)s %(name)s: %(message)s",
     )
     if ctx.invoked_subcommand is None:
-        ui.console.print(ctx.get_help())
-        raise typer.Exit(code=0)
+        _finish(lambda: workflow.run_serve(workflow.ServeOptions(model=model)))
+
+
+EXIT_INTERRUPTED = 130
+
+
+def _finish(action: Callable[[], int]) -> None:
+    """Run ``action`` and exit with its code; failures become one error line (traceback only with ``--verbose``).
+
+    Args:
+        action: The command body, returning the exit code.
+
+    Raises:
+        Exit: Always, carrying the exit code.
+    """
+    try:
+        code = action()
+    except (workflow.WorkflowError, LlamaCppError, ModelNotFoundError) as exc:
+        ui.show_notice("error", str(exc))
+        code = 1
+    except KeyboardInterrupt:
+        ui.show_notice("warn", "Interrupted.")
+        code = EXIT_INTERRUPTED
+    except Exception as exc:
+        logger.debug("Unexpected failure", exc_info=True)
+        ui.show_notice("error", f"Unexpected error: {exc}")
+        if _state.verbose:
+            ui.console.print_exception(show_locals=False)
+        code = 1
+    raise typer.Exit(code=code)
+
+
+@app.command(context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
+def serve(
+    ctx: typer.Context,
+    model: Annotated[str | None, typer.Option("--model", "-m", help="Ollama model name (default: saved/auto).")] = None,
+    ollama_path: Annotated[
+        Path | None, typer.Option("--ollama-path", help="Ollama models directory (contains manifests/ and blobs/).")
+    ] = None,
+    host: Annotated[
+        str | None, typer.Option("--host", help="Address to listen on (default: config or 127.0.0.1).")
+    ] = None,
+    port: Annotated[
+        int | None, typer.Option("--port", min=1, max=65535, help="Port to listen on (default 8080).")
+    ] = None,
+    context: Annotated[int | None, typer.Option("--ctx", min=1, help="Context size in tokens (default 8192).")] = None,
+    detach: Annotated[bool, typer.Option("--detach", help="Run in the background; return once ready.")] = False,
+    restart: Annotated[bool, typer.Option("--restart", help="Replace our own running server.")] = False,
+    dry_run: Annotated[bool, typer.Option("--dry-run", help="Print the command and exit.")] = False,
+    vision: Annotated[
+        bool, typer.Option("--vision", help="Load the multimodal projector when the model has one.")
+    ] = False,
+    yes: Annotated[
+        bool, typer.Option("--yes", "-y", help="Answer yes to questions (e.g. installing llama.cpp).")
+    ] = False,
+) -> None:
+    """Start llama-server on an Ollama model. Extra llama-server arguments go after `--`."""
+    opts = workflow.ServeOptions(
+        model=model or _state.model,
+        ollama_path=ollama_path,
+        host=host,
+        port=port,
+        ctx=context,
+        detach=detach,
+        restart=restart,
+        dry_run=dry_run,
+        vision=vision,
+        assume_yes=yes,
+        extra_args=tuple(ctx.args),
+    )
+    _finish(lambda: workflow.run_serve(opts))
 
 
 @app.command("ver")

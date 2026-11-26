@@ -22,9 +22,14 @@ def test_ver_command():
     assert "ollama2cpp" in r.output
 
 
-def test_no_args_exits_cleanly():
+def test_no_args_runs_serve(monkeypatch):
+    from ollama2cpp import workflow
+
+    seen = []
+    monkeypatch.setattr(workflow, "run_serve", lambda opts: seen.append(opts) or 0)
     r = runner.invoke(app, [])
     assert r.exit_code == 0
+    assert seen == [workflow.ServeOptions()]
 
 
 def test_verbose_flag_accepted():

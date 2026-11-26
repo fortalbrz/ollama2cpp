@@ -174,7 +174,8 @@ def _back_up(path: Path) -> None:
     try:
         Path(path).replace(backup)
     except OSError:
-        log.warning("Could not back up corrupt config %s", path, exc_info=True)
+        log.warning("Could not back up corrupt config %s", path)
+        log.debug("Backup failure details", exc_info=True)
     else:
         log.warning("Corrupt config moved to %s; starting fresh", backup)
 
@@ -195,8 +196,9 @@ def load(base: Path | None = None) -> Config | None:
         return None
     try:
         cfg = _config_from_dict(json.loads(path.read_text(encoding="utf-8")))
-    except (OSError, ValueError):  # ValueError covers JSON, unicode and schema errors
-        log.warning("Config %s is unreadable or invalid", path, exc_info=True)
+    except (OSError, ValueError) as exc:  # ValueError covers JSON, unicode and schema errors
+        log.warning("Config %s is unreadable or invalid (%s)", path, exc)
+        log.debug("Config load failure details", exc_info=True)
         if path.is_file():
             _back_up(path)
         return None

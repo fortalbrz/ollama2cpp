@@ -16,11 +16,20 @@ import psutil
 import pytest
 
 from ollama2cpp import proc
+from ollama2cpp.constants import ENV_HOME, ENV_OLLAMA_MODEL, ENV_OLLAMA_MODELS
 
 DEFAULT_REGISTRY = "registry.ollama.ai"
 DEFAULT_NAMESPACE = "library"
 
 ModelSpec = tuple[str, str, int, dict[str, Any]]
+
+
+@pytest.fixture(autouse=True)
+def _isolated_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Isolate every test: temp ``OLLAMA2CPP_HOME`` (never the real ``~/.ollama2cpp``) and no Ollama env vars."""
+    monkeypatch.setenv(ENV_HOME, str(tmp_path / "o2c-home"))
+    monkeypatch.delenv(ENV_OLLAMA_MODELS, raising=False)
+    monkeypatch.delenv(ENV_OLLAMA_MODEL, raising=False)
 
 
 def _digest(*parts: str) -> str:

@@ -62,3 +62,14 @@ def test_text_normalises():
     assert not proc._text(None)
     assert proc._text(b"ab") == "ab"
     assert proc._text("ab") == "ab"
+
+
+def test_format_command_round_trips_spaces(monkeypatch):
+    monkeypatch.setattr(sys, "platform", "win32")
+    text = proc.format_command([r"C:\Program Files\llama-server.exe", "-m", "a b.gguf"])
+    assert text == r'"C:\Program Files\llama-server.exe" -m "a b.gguf"'
+
+
+def test_format_command_posix(monkeypatch):
+    monkeypatch.setattr(sys, "platform", "linux")
+    assert proc.format_command(["llama-server", "-m", "a b.gguf"]) == "llama-server -m 'a b.gguf'"

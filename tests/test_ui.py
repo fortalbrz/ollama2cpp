@@ -46,3 +46,16 @@ def test_confirm_tty_asks(monkeypatch):
 
 def test_progress_returns_progress():
     assert isinstance(ui.progress(), Progress)
+
+
+def test_panel_shows_title_and_body(captured):
+    ui.panel("First run", "Models: [C:/x]")
+    out = captured.getvalue()
+    assert "First run" in out
+    assert "Models: [C:/x]" in out
+
+
+def test_show_command_does_not_wrap(captured):
+    command = "llama-server -m " + "x" * 200
+    ui.show_command(command)
+    assert command in captured.getvalue()
