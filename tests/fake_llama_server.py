@@ -26,11 +26,11 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self) -> None:
+        ready = time.monotonic() - START >= LOAD_SECONDS
         if self.path == "/health":
-            ready = time.monotonic() - START >= LOAD_SECONDS
             self._send(200 if ready else 503, b'{"status":"ok"}' if ready else b'{"error":"loading"}')
-        elif self.path == "/props":
-            self._send(200, json.dumps({"model_alias": "fake-model"}).encode())
+        elif self.path == "/props":  # like llama-server, 503 while loading
+            self._send(200 if ready else 503, json.dumps({"model_alias": "fake-model"}).encode())
         else:
             self._send(404, b"{}")
 

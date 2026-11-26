@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import socket
 import sys
 import threading
 import time
@@ -329,3 +331,164 @@ def test_start_foreground_ctrl_c_terminates_child(base: Path, monkeypatch: pytes
 def test_log_helpers_tolerate_missing_file(tmp_path: Path):
     assert not server._log_tail(tmp_path / "nope.log", 0)
     server._LogPump(tmp_path / "nope.log", 0).pump()
+
+
+# --- review fixes -------------------------------------------------------------------------------------------------
+
+
+def test_describe_running_ours_while_loading(base: Path, reaper: Track):
+    port = free_port()
+    child = reaper(proc.spawn(_fake_argv(port, 30)))
+    assert _wait(lambda: server.port_in_use(LOCAL, port))
+    server.write_record(base, _rec(child.pid, port))
+    assert not server.is_ready(LOCAL, port)
+    assert server.describe_running(LOCAL, port, base) == ("ours", "m")  # /props is 503: recorded model
+
+
+def test_describe_running_ours_prefers_props_alias_when_ready(base: Path, fake_server: FakeServer):
+    server.write_record(base, _rec(fake_server.process.pid, fake_server.port))
+    assert server.is_ready(fake_server.host, fake_server.port)
+    assert server.describe_running(fake_server.host, fake_server.port, base) == ("ours", "fake-model")
+
+
+def test_describe_running_ours_falls_back_to_recorded_model_on_props_failure(base: Path, reaper: Track):
+    p = reaper(proc.spawn(SLEEP))
+    server.write_record(base, _rec(p.pid, free_port()))  # nothing bound yet
+    rec = server.read_record(base)
+    assert rec is not None
+    assert server.describe_running(LOCAL, rec.port, base) == ("ours", "m")
+
+
+@pytest.mark.parametrize("spelling", ["", "0.0.0.0", "localhost", "LOCALHOST", "127.0.0.1"])
+def test_describe_running_host_aliases(base: Path, reaper: Track, spelling: str):
+    p = reaper(proc.spawn(SLEEP))
+    port = free_port()
+    server.write_record(base, _rec(p.pid, port))
+    assert server.describe_running(spelling, port, base)[0] == "ours"
+
+
+def test_describe_running_foreign_without_record(fake_server: FakeServer, base: Path):
+    assert server.describe_running(fake_server.host, fake_server.port, base) == ("foreign", "fake-model")
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"pid": "abc", "host": LOCAL, "port": 1, "model": "m", "started": "n", "create_time": 1.0},
+        {"pid": -5, "host": LOCAL, "port": 1, "model": "m", "started": "n", "create_time": 1.0},
+        {"pid": True, "host": LOCAL, "port": 1, "model": "m", "started": "n", "create_time": 1.0},
+        {"pid": 5, "host": LOCAL, "port": "80", "model": "m", "started": "n", "create_time": 1.0},
+        {"pid": 5, "host": LOCAL, "port": 70000, "model": "m", "started": "n", "create_time": 1.0},
+        {"pid": 5, "host": 7, "port": 1, "model": "m", "started": "n", "create_time": 1.0},
+        {"pid": 5, "host": LOCAL, "port": 1, "model": "m", "started": "n", "create_time": "x"},
+        {"pid": 5, "host": LOCAL},
+        [1, 2, 3],
+        "text",
+        None,
+    ],
+)
+def test_invalid_record_is_cleared(tmp_path: Path, payload: object):
+    (tmp_path / constants.PID_FILENAME).write_text(json.dumps(payload), encoding="utf-8")
+    assert server.read_record(tmp_path) is None
+    assert not (tmp_path / constants.PID_FILENAME).exists()
+    assert server.stop(tmp_path) is False
+
+
+def _garbage_server(reply: bytes) -> tuple[socket.socket, int, threading.Thread]:
+    sock = socket.socket()
+    sock.bind((LOCAL, 0))
+    sock.listen(5)
+    sock.settimeout(0.2)
+    stop = threading.Event()
+
+    def serve() -> None:
+        while not stop.is_set():
+            try:
+                conn, _ = sock.accept()
+            except OSError:
+                continue
+            with conn:
+                conn.settimeout(0.2)
+                try:
+                    conn.recv(1024)
+                    if reply:
+                        conn.sendall(reply)
+                except OSError:
+                    pass
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    thread.stop = stop  # type: ignore[attr-defined]
+    return sock, sock.getsockname()[1], thread
+
+
+@pytest.mark.parametrize("reply", [b"garbage not http\r\n\r\n", b""])
+def test_non_http_listener_is_foreign_not_a_crash(reply: bytes, tmp_path: Path):
+    sock, port, thread = _garbage_server(reply)
+    try:
+        assert not server.health(LOCAL, port)
+        assert server.props(LOCAL, port) is None
+        assert server.describe_running(LOCAL, port, tmp_path) == ("foreign", None)
+    finally:
+        thread.stop.set()  # type: ignore[attr-defined]
+        thread.join(timeout=3)
+        sock.close()
+
+
+def test_start_terminates_child_when_record_write_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    pids: list[int] = []
+    real_spawn = proc.spawn
+
+    def spy(*args: Any, **kw: Any) -> proc.Handle:
+        handle = real_spawn(*args, **kw)
+        pids.append(handle.pid)
+        return handle
+
+    def boom(*_a: Any, **_k: Any) -> None:
+        raise PermissionError("denied")
+
+    monkeypatch.setattr(proc, "spawn", spy)
+    monkeypatch.setattr(server, "write_record", boom)
+    with pytest.raises(PermissionError):
+        server.start(SLEEP, base=tmp_path, host=LOCAL, port=free_port(), model="m", detach=True)
+    assert _wait(lambda: _dead(pids[0]))
+
+
+def test_start_foreground_pump_error_terminates_child_and_clears_record(base: Path, monkeypatch: pytest.MonkeyPatch):
+    pids: list[int] = []
+    real_spawn = proc.spawn
+
+    def spy(*args: Any, **kw: Any) -> proc.Handle:
+        handle = real_spawn(*args, **kw)
+        pids.append(handle.pid)
+        return handle
+
+    def explode(self: server._LogPump) -> None:
+        raise UnicodeEncodeError("ascii", "x", 0, 1, "console")
+
+    monkeypatch.setattr(proc, "spawn", spy)
+    monkeypatch.setattr(server._LogPump, "pump", explode)
+    with pytest.raises(UnicodeEncodeError):
+        server.start(SLEEP, base=base, host=LOCAL, port=free_port(), model="m", detach=False)
+    assert _wait(lambda: _dead(pids[0]))
+    assert not (base / constants.PID_FILENAME).exists()
+
+
+def test_start_detach_keyboard_interrupt_terminates_child(base: Path, monkeypatch: pytest.MonkeyPatch):
+    pids: list[int] = []
+    real_spawn = proc.spawn
+
+    def spy(*args: Any, **kw: Any) -> proc.Handle:
+        handle = real_spawn(*args, **kw)
+        pids.append(handle.pid)
+        return handle
+
+    def interrupted(*_a: Any, **_k: Any) -> bool:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(proc, "spawn", spy)
+    monkeypatch.setattr(server, "health", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        server.start(SLEEP, base=base, host=LOCAL, port=free_port(), model="m", detach=True, ready_timeout=10)
+    assert _wait(lambda: _dead(pids[0]))
+    assert not (base / constants.PID_FILENAME).exists()

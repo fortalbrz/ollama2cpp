@@ -7,6 +7,7 @@ terminated. A bare pid is not proof, because operating systems reuse pids.
 from __future__ import annotations
 
 import codecs
+import http.client
 import json
 import logging
 import socket
@@ -31,6 +32,7 @@ __all__ = [
     "clear_record",
     "describe_running",
     "health",
+    "is_ready",
     "port_in_use",
     "props",
     "read_record",
@@ -48,6 +50,7 @@ POLL_INTERVAL = 0.1
 PROBE_TIMEOUT = 0.3  # loopback answers instantly; Windows needs ~1 s to report a refused connection
 KILL_GRACE = 3.0
 HTTP_OK = 200
+MAX_PORT = 65536
 _ANY_V4 = {"", "0.0.0.0"}
 _ANY_V6 = {"::", "[::]"}
 
@@ -83,9 +86,10 @@ def _connect_host(host: str) -> str:
         host: Configured listen address.
 
     Returns:
-        str: Loopback for wildcard addresses, otherwise ``host`` unchanged.
+        str: Loopback for wildcard addresses and ``localhost``, otherwise ``host`` lower-cased without brackets.
     """
-    if host in _ANY_V4:
+    host = host.strip().lower()
+    if host in _ANY_V4 or host == "localhost":
         return "127.0.0.1"
     if host in _ANY_V6:
         return "::1"
@@ -112,7 +116,7 @@ def _get(host: str, port: int, path: str, timeout: float) -> tuple[int, bytes] |
             return resp.status, resp.read()
     except urllib.error.HTTPError as exc:
         return exc.code, b""
-    except (urllib.error.URLError, OSError, ValueError):
+    except (urllib.error.URLError, http.client.HTTPException, OSError, ValueError):
         return None
 
 
@@ -271,6 +275,30 @@ def clear_record(base: Path | None = None) -> None:
         logger.warning("could not remove pid file: %s", exc)
 
 
+def _parse_record(data: object) -> ServerRecord | None:
+    """Build a record from decoded JSON, validating every field's type and range.
+
+    Args:
+        data: Decoded JSON document.
+
+    Returns:
+        ServerRecord | None: The record, or None when ``data`` is not a well-formed record.
+    """
+    if not isinstance(data, dict):
+        return None
+    pid, host, port = data.get("pid"), data.get("host"), data.get("port")
+    model, started, ctime = data.get("model"), data.get("started"), data.get("create_time")
+    if not (isinstance(pid, int) and not isinstance(pid, bool) and pid > 0):
+        return None
+    if not (isinstance(port, int) and not isinstance(port, bool) and 0 < port < MAX_PORT):
+        return None
+    if not (isinstance(ctime, int | float) and not isinstance(ctime, bool)):
+        return None
+    if not (isinstance(host, str) and isinstance(model, str) and isinstance(started, str)):
+        return None
+    return ServerRecord(pid, host, port, model, started, float(ctime))
+
+
 def read_record(base: Path | None = None) -> ServerRecord | None:
     """Load the pid record, discarding it when stale, corrupt or pointing at a different process.
 
@@ -284,8 +312,11 @@ def read_record(base: Path | None = None) -> ServerRecord | None:
     if not path.is_file():
         return None
     try:
-        rec = ServerRecord(**json.loads(path.read_text(encoding="utf-8")))
-    except (OSError, ValueError, TypeError):
+        rec = _parse_record(json.loads(path.read_text(encoding="utf-8")))
+    except (OSError, ValueError):
+        rec = None
+    if rec is None:
+        logger.warning("discarding unreadable or invalid pid record %s", path)
         clear_record(base)
         return None
     if not _is_ours(rec):
@@ -297,8 +328,37 @@ def read_record(base: Path | None = None) -> ServerRecord | None:
 # --- inspection ----------------------------------------------------------------------------------------------------
 
 
+def is_ready(host: str, port: int) -> bool:
+    """Tell whether the server on ``host:port`` is up and finished loading.
+
+    Args:
+        host: Server address.
+        port: Server port.
+
+    Returns:
+        bool: True when ``/health`` returns 200 (readiness only; identity comes from the record).
+    """
+    return health(host, port)
+
+
+def _same_host(left: str, right: str) -> bool:
+    """Compare two listen addresses, treating wildcard and ``localhost`` spellings as equivalent.
+
+    Args:
+        left: First address.
+        right: Second address.
+
+    Returns:
+        bool: True when both resolve to the same connect address.
+    """
+    return _connect_host(left) == _connect_host(right)
+
+
 def describe_running(host: str, port: int, base: Path | None = None) -> tuple[str, str | None]:
     """Classify whatever is on ``host:port``.
+
+    Identity comes from the pid record (valid pid and creation time, same host and port); health only
+    describes state, so a server of ours that is still loading is still ``"ours"`` (see ``is_ready``).
 
     Args:
         host: Address to inspect.
@@ -306,16 +366,16 @@ def describe_running(host: str, port: int, base: Path | None = None) -> tuple[st
         base: Storage directory (None for the default).
 
     Returns:
-        tuple[str, str | None]: ``("ours", alias)`` for a healthy server matching our valid record,
-            ``("foreign", alias)`` for any other listener, ``("none", None)`` when the port is free.
-            ``alias`` comes from ``/props`` when obtainable.
+        tuple[str, str | None]: ``("ours", alias)`` when a valid record matches host and port, where ``alias``
+            comes from ``/props`` and falls back to the recorded model; ``("foreign", alias)`` for a listener
+            without such a record; ``("none", None)`` when nothing is there.
     """
     rec = read_record(base)
-    if not port_in_use(host, port):
-        return "none", None
-    matches = rec is not None and rec.host == host and rec.port == port
-    verdict = "ours" if matches and health(host, port) else "foreign"
-    return verdict, _model_alias(props(host, port))
+    listening = port_in_use(host, port)
+    alias = _model_alias(props(host, port)) if listening else None
+    if rec is not None and rec.port == port and _same_host(rec.host, host):
+        return "ours", alias or rec.model
+    return ("foreign", alias) if listening else ("none", None)
 
 
 def _refuse_if_occupied(host: str, port: int, base: Path | None) -> None:
@@ -489,6 +549,9 @@ def _run_foreground(child: proc.Handle, log: Path, offset: int) -> int:
 def _wait_ready(child: proc.Handle, host: str, port: int, ready_timeout: float, log: Path, offset: int) -> None:
     """Block until ``/health`` returns 200, the child dies, or the deadline passes.
 
+    A child that exits first, or is still not ready at the deadline, raises
+    ``LlamaCppError`` with the log tail.
+
     Args:
         child: Running server process.
         host: Listen address.
@@ -496,9 +559,6 @@ def _wait_ready(child: proc.Handle, host: str, port: int, ready_timeout: float, 
         ready_timeout: Seconds to wait.
         log: Log file the child writes to.
         offset: Byte offset where this run's output begins.
-
-    A child that exits first, or is still not ready at the deadline (it is then terminated), raises
-    ``LlamaCppError`` with the log tail.
     """
     deadline = time.monotonic() + ready_timeout
     while time.monotonic() < deadline:
@@ -508,8 +568,30 @@ def _wait_ready(child: proc.Handle, host: str, port: int, ready_timeout: float, 
         if health(host, port, timeout=PROBE_TIMEOUT):
             return
         time.sleep(POLL_INTERVAL)
-    _terminate_tree(child.pid, KILL_GRACE)
     raise _failure(f"llama-server was not ready after {ready_timeout:g}s", log, offset)
+
+
+def _supervise(
+    child: proc.Handle, rec: ServerRecord, base: Path | None, log: Path, offset: int, ready_timeout: float | None
+) -> int:
+    """Record the child, then wait for readiness (detach) or stream until it exits (foreground).
+
+    Args:
+        child: Running server process.
+        rec: Record to persist for it.
+        base: Storage directory (None for the default).
+        log: Log file the child writes to.
+        offset: Byte offset where this run's output begins.
+        ready_timeout: Seconds to wait for readiness, or None for foreground mode.
+
+    Returns:
+        int: 0 once ready (detach) or the child's exit code (foreground).
+    """
+    write_record(base, rec)
+    if ready_timeout is None:
+        return _run_foreground(child, log, offset)
+    _wait_ready(child, rec.host, rec.port, ready_timeout, log, offset)
+    return 0
 
 
 def start(
@@ -525,7 +607,9 @@ def start(
     """Start ``llama-server`` and record it.
 
     Foreground mode streams the server output to the console until it exits or Ctrl-C; detach mode returns
-    once ``/health`` answers 200. Output always goes to ``<base>/server.log``.
+    once ``/health`` answers 200. Output always goes to ``<base>/server.log``. Raises ``LlamaCppError`` when the
+    port is occupied or the server fails to become ready. On any failure the child is terminated and the record
+    cleared, so no unrecorded server is left running.
 
     Args:
         argv: Full ``llama-server`` command line.
@@ -538,24 +622,19 @@ def start(
 
     Returns:
         int: Exit code of the server (foreground) or 0 once ready (detach).
-
-    Raises:
-        LlamaCppError: If the port is occupied, or the server fails to become ready.
     """
     _refuse_if_occupied(host, port, base)
     log = _base(base) / LOG_FILENAME
     offset = log.stat().st_size if log.is_file() else 0
     child = proc.spawn(argv, log_path=log, detach=detach)
-    write_record(base, _record_for(child.pid, host, port, model))
     try:
-        if not detach:
-            return _run_foreground(child, log, offset)
-        try:
-            _wait_ready(child, host, port, ready_timeout, log, offset)
-        except LlamaCppError:
-            clear_record(base)
-            raise
-        return 0
-    finally:
-        if not detach:
-            clear_record(base)
+        rec = _record_for(child.pid, host, port, model)
+        code = _supervise(child, rec, base, log, offset, ready_timeout if detach else None)
+    except BaseException:
+        if child.poll() is None:
+            _terminate_tree(child.pid, KILL_GRACE)
+        clear_record(base)
+        raise
+    if not detach:
+        clear_record(base)
+    return code
