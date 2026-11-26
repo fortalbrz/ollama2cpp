@@ -8,7 +8,9 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-__all__ = ["ProcResult", "run", "spawn"]
+__all__ = ["Handle", "ProcResult", "run", "spawn"]
+
+Handle = subprocess.Popen[str]  # running-process handle, re-exported so other modules need not import subprocess
 
 RC_NOT_FOUND = 127
 RC_TIMEOUT = 124

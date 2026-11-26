@@ -4,11 +4,18 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Callable, Iterable
+import socket
+import sys
+import time
+from collections.abc import Callable, Iterable, Iterator
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import psutil
 import pytest
+
+from ollama2cpp import proc
 
 DEFAULT_REGISTRY = "registry.ollama.ai"
 DEFAULT_NAMESPACE = "library"
@@ -85,3 +92,62 @@ def fake_ollama(tmp_path: Path) -> Callable[..., Path]:
         return root
 
     return build
+
+
+FAKE_SERVER = Path(__file__).parent / "fake_llama_server.py"
+SERVER_WAIT = 15.0
+
+
+@pytest.fixture
+def reaper() -> Iterator[Callable[[proc.Handle], proc.Handle]]:
+    """Track spawned processes and kill them (with children) at teardown.
+
+    Yields:
+        Callable: ``track(process)`` registers a process and returns it.
+    """
+    procs: list[proc.Handle] = []
+
+    def track(process: proc.Handle) -> proc.Handle:
+        procs.append(process)
+        return process
+
+    yield track
+    for p in procs:
+        try:
+            for child in psutil.Process(p.pid).children(recursive=True):
+                child.kill()
+        except psutil.Error:
+            pass
+        if p.poll() is None:
+            p.kill()
+        p.wait(timeout=10)
+
+
+def free_port() -> int:
+    """Return a currently free local TCP port."""
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+@dataclass
+class FakeServer:
+    """A running stand-in ``llama-server``."""
+
+    process: proc.Handle
+    host: str
+    port: int
+
+
+@pytest.fixture
+def fake_server(tmp_path: Path, reaper: Callable[[proc.Handle], proc.Handle]) -> FakeServer:
+    """Start a stand-in ``llama-server`` on a free port (healthy immediately)."""
+    port_file = tmp_path / "fake.port"
+    process = reaper(proc.spawn([sys.executable, str(FAKE_SERVER), "0", str(port_file)]))
+    deadline = time.monotonic() + SERVER_WAIT
+    while time.monotonic() < deadline:
+        if port_file.is_file() and port_file.read_text(encoding="utf-8"):
+            return FakeServer(process, "127.0.0.1", int(port_file.read_text(encoding="utf-8")))
+        time.sleep(0.02)
+    msg = "fake server did not start"
+    raise RuntimeError(msg)
