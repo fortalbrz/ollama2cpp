@@ -760,7 +760,9 @@ def test_validation_failure_steps_down_ctx_then_succeeds(env: Env):
     assert profile.tg_tps == pytest.approx(55.0)
     saved = config.load(env.base)
     assert saved is not None
-    assert set(saved.profiles) == {profile_key(DIGEST, 4096)}
+    assert set(saved.profiles) == {profile_key(DIGEST, 4096), profile_key(DIGEST, 8192)}
+    assert saved.profiles[profile_key(DIGEST, 8192)] == saved.profiles[profile_key(DIGEST, 4096)]
+    assert saved.profiles[profile_key(DIGEST, 8192)].ctx == 4096
 
 
 def test_validation_step_down_lowers_ngl_when_ctx_at_minimum(env: Env):
@@ -837,6 +839,39 @@ def test_optimize_cpu_only_has_no_device(env: Env, monkeypatch: pytest.MonkeyPat
     assert all("-dev" not in c for c in env.bench.calls)
     assert profile.fingerprint["gpu"] == "cpu"
     assert _flag(profile.args, "-ngl") == "0"
+
+
+def test_cpu_only_never_sweeps_ngl_and_keeps_flash_attn_off_for_seed(env: Env):
+    env.device = None
+    env.run(time_limit=1e9)
+    assert env.bench.calls
+    assert {_flag(c, "-ngl") for c in env.bench.calls} == {"0"}
+    assert _flag(env.bench.calls[0], "-fa") == "off"
+
+
+def test_quick_mode_stores_shrunk_seed_under_requested_and_actual_ctx(env: Env):
+    env.device = Device("Vulkan0", "Small GPU", 1200, 1200)
+    profile = env.run(quick=True, ctx=32768)
+    assert profile.ctx < 32768
+    saved = config.load(env.base)
+    assert saved is not None
+    assert set(saved.profiles) == {profile_key(DIGEST, profile.ctx), profile_key(DIGEST, 32768)}
+    assert {p.ctx for p in saved.profiles.values()} == {profile.ctx}
+
+
+def test_rerun_overwrites_both_keys_and_leaves_unrelated_key(env: Env):
+    env.device = Device("Vulkan0", "Small GPU", 1200, 1200)
+    other = Profile(args=["-ngl", "1"], ctx=4096, measured=True, tg_tps=9.0)
+    env.cfg.profiles["other:4096"] = other
+    first = env.run(quick=True, ctx=32768)
+    second = env.run(quick=True, ctx=32768)
+    assert second is not first
+    saved = config.load(env.base)
+    assert saved is not None
+    assert set(saved.profiles) == {profile_key(DIGEST, first.ctx), profile_key(DIGEST, 32768), "other:4096"}
+    assert saved.profiles["other:4096"] == other
+    assert saved.profiles[profile_key(DIGEST, 32768)].timestamp == second.timestamp
+    assert saved.profiles[profile_key(DIGEST, first.ctx)].timestamp == second.timestamp
 
 
 def test_optimize_save_failure_never_raises(env: Env, monkeypatch: pytest.MonkeyPatch):

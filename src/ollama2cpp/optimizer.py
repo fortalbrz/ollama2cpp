@@ -720,13 +720,14 @@ def _bench_table(results: Sequence[BenchResult]) -> list[dict[str, Any]]:
     return [{"args": list(r.args), "tg_tps": r.tg_tps, "pp_tps": r.pp_tps, "error": r.error} for r in results]
 
 
-def _store(cfg: Config, base: Path | None, key: str, profile: Profile) -> Profile:
-    """Record ``profile`` under ``key`` and persist the config; a failed save is logged, never raised."""
-    cfg.profiles[key] = profile
+def _store(cfg: Config, base: Path | None, keys: Sequence[str], profile: Profile) -> Profile:
+    """Record ``profile`` under every key in ``keys`` and persist the config; a failed save is logged, never raised."""
+    for key in keys:
+        cfg.profiles[key] = profile
     try:
         config.save(cfg, base)
     except Exception:
-        log.warning("Could not save the profile for %s", key, exc_info=True)
+        log.warning("Could not save the profile for %s", ", ".join(keys), exc_info=True)
     return profile
 
 
@@ -748,7 +749,8 @@ def optimize_model(
     Seed from the GGUF and hardware; unless ``quick``, sweep with ``llama-bench``, then launch the winner as a real
     server. A failed validation steps down once (ctx, then ``ngl``); if that fails too the unmeasured seed is saved.
     ``quick`` saves the unmeasured seed without launching anything. The profile is stored in ``cfg`` under
-    ``profile_key(digest, final_ctx)`` and the config is written (a write failure is logged, never raised).
+    ``profile_key(digest, final_ctx)`` (and also under the requested ctx when that differs, so a lookup by the
+    requested ctx finds it); the config is written (a write failure is logged, never raised).
 
     Args:
         model: The installed Ollama model.
@@ -790,7 +792,7 @@ def optimize_model(
                 seed,
                 host,
                 time_limit=time_limit,
-                block_count=info.block_count,
+                block_count=info.block_count if device else None,  # no ngl sweep without a GPU
                 allow_kv_quant=allow_kv_quant,
                 device=device.id if device else None,
                 on_progress=on_progress,
@@ -805,7 +807,10 @@ def optimize_model(
             profile.args, profile.ctx = seed_to_args(final), final.ctx
             if result is not None and result.tg_tps is not None:
                 profile.tg_tps, profile.pp_tps, profile.measured = result.tg_tps, result.pp_tps, True
-    return _store(cfg, base, profile_key(model.digest, profile.ctx), profile)
+    # The same profile is also reachable by the requested ctx, so `serve --ctx <requested>` finds it even when the
+    # actual ctx (``profile.ctx``) was reduced to fit or by validation step-down.
+    keys = list(dict.fromkeys([profile_key(model.digest, profile.ctx), profile_key(model.digest, ctx)]))
+    return _store(cfg, base, keys, profile)
 
 
 def _now() -> str:
