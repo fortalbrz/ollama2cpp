@@ -1,0 +1,3 @@
+Available devices:
+  Vulkan0: NVIDIA GeForce RTX 5060 Ti (7891 MiB, 5198 MiB free)
+  Vulkan1: AMD Radeon(TM) Graphics (32568 MiB, 30939 MiB free)
