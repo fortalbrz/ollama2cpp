@@ -315,6 +315,51 @@ def test_sweep_tie_breaks_on_prompt_speed(monkeypatch: pytest.MonkeyPatch):
     assert all(_flag(c, "-ub") == "1024" for c in later)
 
 
+def _res(tg: float | None, pp: float | None = 100.0) -> BenchResult:
+    return BenchResult(("x",), tg, pp)
+
+
+def test_beats_ignores_noise_level_generation_differences():
+    assert not optimizer._beats(_res(30.5, 100.0), _res(30.0, 100.0))  # +1.7 %: noise
+    assert not optimizer._beats(_res(29.5, 100.0), _res(30.0, 100.0))
+    assert not optimizer._beats(_res(30.1, 101.0), _res(30.0, 100.0))  # pp gain is noise too
+
+
+def test_beats_takes_a_real_generation_improvement():
+    assert optimizer._beats(_res(30.7, 50.0), _res(30.0, 100.0))  # +2.3 %, even with slower prompts
+    assert optimizer._beats(_res(45.0), _res(30.0))
+
+
+def test_beats_within_tolerance_needs_a_real_prompt_speed_gain():
+    assert optimizer._beats(_res(30.2, 103.0), _res(30.0, 100.0))  # tg tie, pp +3 %
+    assert optimizer._beats(_res(29.8, 103.0), _res(30.0, 100.0))  # tg a hair lower but within tolerance
+    assert not optimizer._beats(_res(30.0, 101.0), _res(30.0, 100.0))
+    assert not optimizer._beats(_res(30.0, 100.0), _res(30.0, 100.0))
+
+
+def test_beats_rejects_a_clearly_slower_candidate_whatever_its_prompt_speed():
+    assert not optimizer._beats(_res(25.0, 900.0), _res(30.0, 100.0))
+
+
+def test_beats_failed_and_first_results():
+    assert not optimizer._beats(_res(None), _res(30.0))
+    assert optimizer._beats(_res(1.0), None)
+    assert optimizer._beats(_res(1.0), _res(None))
+    assert optimizer._beats(_res(30.0, None), _res(30.0, None)) is False  # no pp on either side: incumbent stays
+
+
+def test_sweep_keeps_the_incumbent_when_generation_speed_only_wiggles(monkeypatch: pytest.MonkeyPatch):
+    def speed(argv: list[str]) -> tuple[float, float]:
+        tg = {"256": 30.2, "512": 30.0, "1024": 30.4, "2048": 29.9}[_flag(argv, "-ub")]
+        return 100.0, tg
+
+    fake = _install(monkeypatch, FakeBench(speed))
+    _sweep()
+    later = [c for c in fake.calls if _flag(c, "-t") != "8"]
+    assert later
+    assert all(_flag(c, "-ub") == "512" for c in later)  # the seed's ubatch stays: no step gained 2 %
+
+
 def test_sweep_skips_failed_candidates(monkeypatch: pytest.MonkeyPatch):
     def speed(argv: list[str]) -> tuple[float, float] | str:
         ub = _flag(argv, "-ub")
@@ -378,6 +423,31 @@ def test_keyboard_interrupt_keeps_best(monkeypatch: pytest.MonkeyPatch):
     assert all(r.tg_tps is not None for r in results)
 
 
+def test_sweep_object_records_that_it_was_interrupted(monkeypatch: pytest.MonkeyPatch):
+    def speed(argv: list[str]) -> tuple[float, float]:
+        if len(fake.calls) == 3:
+            raise KeyboardInterrupt
+        return 100.0, 10.0 * len(fake.calls)
+
+    fake = _install(monkeypatch, FakeBench(speed))
+    run = optimizer._Sweep(
+        BENCH,
+        MODEL,
+        _seed(),
+        _host(),
+        time_limit=1e9,
+        block_count=BLOCKS,
+        allow_kv_quant=False,
+        device=None,
+        on_progress=None,
+        clock=lambda: 0.0,
+    )
+    assert not run.interrupted
+    run.run()
+    assert run.interrupted
+    assert len(run.results) == 2
+
+
 def test_sweep_ngl_dimension_when_partial(monkeypatch: pytest.MonkeyPatch):
     def speed(argv: list[str]) -> tuple[float, float]:
         return 100.0, 100.0 - abs(int(_flag(argv, "-ngl")) - 22)
@@ -437,6 +507,26 @@ def test_vram_preflight_shortfall():
 def test_vram_preflight_ok_and_missing_device():
     assert vram_preflight(100, Device("Vulkan0", "GPU", 8000, 600)) == 0
     assert vram_preflight(7000, None) == 0
+
+
+def test_vram_preflight_model_larger_than_the_card_can_only_use_the_whole_card():
+    assert vram_preflight(20000, Device("Vulkan0", "GPU", 8000, 8000)) == 0
+    assert vram_preflight(20000, Device("Vulkan0", "GPU", 8000, 7000)) == 1000  # not 13000
+
+
+def test_vram_preflight_need_below_free_is_no_shortfall():
+    assert vram_preflight(5000, Device("Vulkan0", "GPU", 8000, 5000)) == 0
+    assert vram_preflight(5000, Device("Vulkan0", "GPU", 8000, 7000)) == 0
+
+
+def test_vram_preflight_small_and_large_holds():
+    # 7544 needed on the real host: the desktop holds ~770 MiB (small), a game holds ~4900 MiB (large)
+    assert vram_preflight(7544, Device("Vulkan0", "GPU", 7891, 7123)) == 421
+    assert vram_preflight(7544, Device("Vulkan0", "GPU", 7891, 3000)) == 4544
+
+
+def test_vram_preflight_unknown_free_memory_is_no_shortfall():
+    assert vram_preflight(7000, Device("Vulkan0", "GPU", 8000, 0)) == 0  # free 0 means "not reported"
 
 
 class _OllamaHandler(BaseHTTPRequestHandler):
@@ -554,7 +644,7 @@ def _settings(tmp_path: Path) -> ServeSettings:
 class ServerSeam:
     """Fakes ``server.start`` / ``server.stop`` and records the calls."""
 
-    def __init__(self, start_error: Exception | None = None) -> None:
+    def __init__(self, start_error: BaseException | None = None) -> None:
         self.start_error = start_error
         self.starts: list[dict[str, Any]] = []
         self.stops: list[Path | None] = []
@@ -610,6 +700,13 @@ def test_validate_start_failure_returns_false_and_stops(
     seam = _seam(monkeypatch, ServerSeam(start_error=error))
     assert validate(Path("llama-server"), _settings(tmp_path), base=tmp_path) is False
     assert len(seam.stops) == 1
+
+
+def test_validate_interrupt_stops_the_probe_and_propagates(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    seam = _seam(monkeypatch, ServerSeam(start_error=KeyboardInterrupt()))
+    with pytest.raises(KeyboardInterrupt):
+        validate(Path("llama-server"), _settings(tmp_path), base=tmp_path)
+    assert seam.stops == [tmp_path / "validate"]  # the probe server never outlives Ctrl-C
 
 
 @pytest.mark.parametrize(
@@ -888,6 +985,109 @@ def test_optimize_default_base_resolves_home_at_call_time(env: Env, tmp_path: Pa
     monkeypatch.setenv("OLLAMA2CPP_HOME", str(tmp_path / "home"))
     env.run(quick=True, base=None)
     assert (tmp_path / "home" / "config.json").is_file()
+
+
+def test_optimize_seed_budgets_the_free_vram_not_the_total(env: Env):
+    # the model fits the 8192 MiB card, but only 520 MiB are free now: sweep with partial offload instead of OOM-ing
+    env.device = Device("Vulkan0", "Fake GPU", 8192, 520)
+    profile = env.run()
+    info = optimizer.read_gguf(env.blob)
+    full = info.block_count + 1
+    assert _flag(env.bench.calls[0], "-ngl") != str(full)  # the seed is a partial offload
+    assert {int(_flag(c, "-ngl")) for c in env.bench.calls} > {int(_flag(env.bench.calls[0], "-ngl"))}  # ngl was swept
+    assert info.block_count == 8
+    assert profile.fingerprint["vram_mib"] == "8192"  # the fingerprint still describes the card, not what is free
+
+
+def test_optimize_seed_with_everything_free_is_a_full_offload_without_ngl_sweep(env: Env):
+    env.run()
+    assert {_flag(c, "-ngl") for c in env.bench.calls} == {"9"}
+
+
+def test_optimize_model_larger_than_the_card_is_swept_with_partial_offload(env: Env):
+    env.device = Device("Vulkan0", "Fake GPU", 512, 512)  # not even the runtime overhead fits
+    env.run()
+    assert len({_flag(c, "-ngl") for c in env.bench.calls}) > 1
+
+
+def test_optimize_free_vram_unknown_falls_back_to_the_total(env: Env):
+    env.device = Device("Vulkan0", "Fake GPU", 8192, 0)
+    env.run()
+    assert {_flag(c, "-ngl") for c in env.bench.calls} == {"9"}
+
+
+def test_optimize_seed_basis_is_shared_with_the_cli_report():
+    info = optimizer.GgufInfo(
+        architecture="llama",
+        block_count=8,
+        context_length=4096,
+        embedding_length=64,
+        head_count=4,
+        head_count_kv=4,
+        key_length=None,
+        file_type=None,
+        is_embedding=False,
+        file_size=100,
+    )
+    device = Device("Vulkan0", "GPU", 8192, 520)
+    assert optimizer.optimize_seed(info, _host(), device, 8192) == optimizer.heuristic_seed(
+        info, _host(), replace(device, total_mib=520), 8192
+    )
+    assert optimizer.optimize_seed(info, _host(), None, 8192) == optimizer.heuristic_seed(info, _host(), None, 8192)
+
+
+def test_interrupt_during_the_sweep_skips_validation_and_saves_the_measured_winner(env: Env):
+    calls: list[int] = []
+
+    def speed(argv: list[str]) -> tuple[float, float]:
+        calls.append(1)
+        if len(calls) == 3:
+            raise KeyboardInterrupt
+        return 100.0, 20.0 * len(calls)
+
+    env.bench.speed = speed
+    profile = env.run()
+    assert env.validated == []  # no real server was started
+    assert profile.measured is True
+    assert profile.validated is False
+    assert profile.tg_tps == pytest.approx(40.0)
+    saved = config.load(env.base)
+    assert saved is not None
+    stored = saved.profiles[profile_key(DIGEST, 8192)]
+    assert stored.validated is False
+    assert stored.measured is True
+
+
+def test_interrupt_before_any_result_saves_the_unmeasured_unvalidated_seed(env: Env):
+    def speed(argv: list[str]) -> tuple[float, float]:
+        raise KeyboardInterrupt
+
+    env.bench.speed = speed
+    profile = env.run()
+    assert env.validated == []
+    assert profile.measured is False
+    assert profile.validated is False
+    assert profile.args == seed_to_args(_expected_seed(env))
+
+
+def test_interrupt_during_validation_keeps_the_measured_winner(env: Env):
+    def verdict(_settings: ServeSettings) -> bool:
+        raise KeyboardInterrupt
+
+    env.verdicts = verdict
+    profile = env.run()
+    assert profile.measured is True
+    assert profile.validated is False
+    assert profile.tg_tps == pytest.approx(55.0)
+    assert _flag(profile.args, "-ub") == "1024"
+    saved = config.load(env.base)
+    assert saved is not None
+    assert saved.profiles[profile_key(DIGEST, 8192)].validated is False
+
+
+def test_normal_run_is_validated(env: Env):
+    assert env.run().validated is True
+    assert env.run(quick=True).validated is True  # quick launches nothing and says so through `measured`, not this
 
 
 def test_decode_body_and_loaded_models_tolerate_garbage():

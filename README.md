@@ -80,7 +80,7 @@ Settable config keys: `host`, `port`, `device`, `ollama_path`, `default_model`, 
 Sample `list` output (trimmed):
 
 ```
-Ollama models in C:\Users\jorge\.ollama\models
+Ollama models in C:\Users\you\.ollama\models
 ┌───────────────────┬──────────┬────────┬────────┬────────┬─────────────┬───────────┬───────────┐
 │ Name              │ Size GiB │ Quant  │ Arch   │ Ctx    │ Kind        │ Fits VRAM │ Optimized │
 ├───────────────────┼──────────┼────────┼────────┼────────┼─────────────┼───────────┼───────────┤
@@ -116,8 +116,12 @@ Options:
 - `--unload-ollama`: if Ollama holds the VRAM the model needs, ask it to unload its models first.
 - `--stop-server`: stop the ollama2cpp server that is running (it holds VRAM) before benchmarking.
 
-The full sweep needs the model to fit in free VRAM. If it does not, `optimize` refuses with the shortfall
-instead of benchmarking numbers that would not reflect an empty GPU; see Troubleshooting.
+The sweep optimizes for the VRAM that is free right now. A model that does not fit completely is benchmarked
+with a partial offload (the number of GPU layers is part of the sweep), and a model larger than the card is
+always a partial offload. `optimize` refuses only when other processes hold a lot of VRAM (more than 1 GiB) and
+the model needs memory that is not free; it then says how much is in use and how to free it (see
+Troubleshooting). Ctrl-C keeps the best result measured so far: it is saved without the final validation and
+`serve` says so.
 
 ## Configuration
 
@@ -147,10 +151,16 @@ Environment variables:
 - `optimize` says VRAM is short: Ollama keeps models loaded for a while after use. Run `ollama stop MODEL`
   or pass `--unload-ollama`. Also close other GPU users, or stop our own server (`stop` / `--stop-server`).
 - Several GPUs (for example an NVIDIA card plus an integrated AMD GPU under Vulkan): `doctor` and `status`
-  list them. Ollama2cpp picks the best one; to pin another, use `config --set device=Vulkan1`
+  list them. ollama2cpp picks the best one; to pin another, use `config --set device=Vulkan1`
   (ids as printed by `llama-server --list-devices`). `config --set device=none` goes back to automatic.
-- `Model 'x' not found`: an `OLLAMA_MODEL` environment variable naming a model you do not have wins over the
-  saved default. Unset it, or pass `--model`. The error lists the installed models.
+- `Model 'x' not found`: a model you name with `--model` (or as the `optimize` argument) must be installed; the
+  error lists the installed models. An `OLLAMA_MODEL` that names a model you do not have is not an error:
+  ollama2cpp warns and falls back to the saved default, then to the automatic choice. Unset it to silence
+  the warning.
+- `llama-bench was not found` (`optimize` without `--quick`): run `ollama2cpp doctor` to see what is missing, then
+  `ollama2cpp update` (or install the full llama.cpp release that ships `llama-bench`).
+- `serve` says the server is already running: its settings may differ from the current profile or options (for
+  example after `optimize`); run `serve --restart` to stop it and start it again with the current ones.
 - `llama-server was not found` and winget is missing (or this is not Windows): install llama.cpp from
   <https://github.com/ggml-org/llama.cpp/releases>, put it on `PATH`, or `config --set llama_server=PATH`.
 - Port in use: `serve --port 9000`, or `stop` if it is our own server.
@@ -166,7 +176,9 @@ uv run pytest -x
 
 `uv run pytest` skips the `live` tests and enforces 90% coverage. The live smoke tests use your real Ollama
 directory and real `llama-server` (they never start a server or run a benchmark) and skip when either is
-missing:
+missing, or when your models live in a custom `OLLAMA_MODELS` directory (the tests clear that variable so they
+only look at the default locations). Run them with `--no-cov`: they exercise a small part of the code, so the
+90% coverage gate would fail a live-only run.
 
 ```
 uv run pytest -m live --no-cov

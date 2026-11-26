@@ -53,6 +53,7 @@ MAX_ERROR_CHARS = 200
 UBATCH_VALUES = (256, 512, 1024, 2048)
 NGL_DELTAS = (2, -2, 4, -4)
 KV_QUANT_TYPE = "q8_0"
+TIE_TOLERANCE = 0.02  # speeds within this fraction are benchmark noise: only a clear gain replaces the incumbent
 VALIDATE_DIRNAME = "validate"  # scratch storage so validation never touches the user's own server record
 VALIDATE_PROMPT = "Hello"
 VALIDATE_TOKENS = 8
@@ -148,6 +149,27 @@ def heuristic_seed(info: GgufInfo, host: HostInfo, device: Device | None, ctx: i
     ngl = info.block_count + 1 if fits else _largest_layer_count(info, device.total_mib, fitted)
     log.debug("Seed for %s: ngl=%d ctx=%d (requested ctx=%d)", device.id, ngl, fitted, ctx)
     return SeedPlan(ngl, fitted, True, threads, SEED_BATCH, SEED_UBATCH, SEED_CACHE_TYPE)
+
+
+def optimize_seed(info: GgufInfo, host: HostInfo, device: Device | None, ctx: int = DEFAULT_CTX) -> SeedPlan:
+    """Pick the starting plan of an ``optimize`` run: like :func:`heuristic_seed`, but budgeting the FREE memory.
+
+    ``serve`` without a profile seeds from the card's *total* VRAM (it assumes nothing else needs the GPU), while a
+    benchmark runs now with whatever is free: a model that does not fully fit in the free memory starts as a partial
+    offload (so the ``-ngl`` dimension is swept) instead of running out of memory on every candidate.
+
+    Args:
+        info: Parsed GGUF facts.
+        host: Host snapshot.
+        device: Chosen GPU, or None for a CPU-only run.
+        ctx: Requested context length in tokens.
+
+    Returns:
+        SeedPlan: The starting settings for the sweep.
+    """
+    if device is not None:
+        device = replace(device, total_mib=min(device.total_mib, available_mib(device)))
+    return heuristic_seed(info, host, device, ctx)
 
 
 def seed_to_args(plan: SeedPlan) -> list[str]:
@@ -370,12 +392,21 @@ def candidate_steps(
 
 
 def _beats(new: BenchResult, best: BenchResult | None) -> bool:
-    """Tell whether ``new`` is better than ``best``: higher generation speed, prompt speed breaks ties."""
+    """Tell whether ``new`` replaces ``best``, treating differences within ``TIE_TOLERANCE`` as noise.
+
+    ``new`` wins with a generation speed more than ``TIE_TOLERANCE`` above ``best``. When the two are within that
+    tolerance on generation speed (either way), it wins only with a prompt speed more than ``TIE_TOLERANCE`` above
+    ``best``'s. Otherwise the incumbent stays, so batch/thread steps are not decided by measurement noise.
+    """
     if new.tg_tps is None:
         return False
     if best is None or best.tg_tps is None:
         return True
-    return (new.tg_tps, new.pp_tps or 0.0) > (best.tg_tps, best.pp_tps or 0.0)
+    if new.tg_tps > best.tg_tps * (1 + TIE_TOLERANCE):
+        return True
+    if new.tg_tps >= best.tg_tps * (1 - TIE_TOLERANCE):
+        return (new.pp_tps or 0.0) > (best.pp_tps or 0.0) * (1 + TIE_TOLERANCE)
+    return False
 
 
 class _Sweep:
@@ -404,6 +435,7 @@ class _Sweep:
         self.results: list[BenchResult] = []
         self.best: BenchResult | None = None
         self.best_plan = seed
+        self.interrupted = False
 
     def measured(self, plan: SeedPlan) -> BenchResult | None:
         """Return the result already measured for ``plan``, if any."""
@@ -442,6 +474,8 @@ class _Sweep:
     def run(self) -> list[BenchResult]:
         """Measure the seed, then each dimension in turn until the budget is spent or the user interrupts.
 
+        Ctrl-C ends the sweep early and sets ``interrupted``; what was measured so far is kept.
+
         Returns:
             list[BenchResult]: Every measured candidate in order (failures included).
         """
@@ -454,6 +488,7 @@ class _Sweep:
             for field, candidates in steps:
                 self._step(field, candidates)
         except KeyboardInterrupt:
+            self.interrupted = True
             log.warning("Sweep interrupted; keeping the best result so far")
         return self.results
 
@@ -573,7 +608,8 @@ def validate(server: Path, settings: ServeSettings, *, base: Path | None = None,
     """Launch the real ``llama-server`` with ``settings`` and check that it generates; never raises.
 
     The probe listens on a free ephemeral loopback port and keeps its pid file and log in ``<base>/validate``, so it
-    cannot collide with, or ever stop, the user's own server. The probe is always stopped.
+    cannot collide with, or ever stop, the user's own server. The probe is always stopped, also on Ctrl-C (a
+    ``KeyboardInterrupt`` is not swallowed: the caller decides what to keep).
 
     Args:
         server: The ``llama-server`` executable.
@@ -603,8 +639,16 @@ def validate(server: Path, settings: ServeSettings, *, base: Path | None = None,
 # --- Ollama / VRAM -------------------------------------------------------------------------------------------------
 
 
+def available_mib(device: Device) -> int:
+    """Return the memory a run can use on ``device`` now: its free memory (the total when that is unknown)."""
+    return device.free_mib if device.free_mib > 0 else device.total_mib
+
+
 def vram_preflight(model_need_mib: int, device: Device | None) -> int:
     """Return how many MiB the model is short of on ``device`` (0 when it fits or there is no device).
+
+    A model larger than the card can only ever use the whole card, so its need is capped at ``device.total_mib``;
+    the shortfall is then just the memory other processes hold. An unknown free figure (0) is no shortfall.
 
     Args:
         model_need_mib: Memory the model needs, in MiB.
@@ -613,9 +657,9 @@ def vram_preflight(model_need_mib: int, device: Device | None) -> int:
     Returns:
         int: Shortfall in MiB computed from ``device.free_mib``.
     """
-    if device is None:
+    if device is None or device.free_mib <= 0:
         return 0
-    return max(0, model_need_mib - device.free_mib)
+    return max(0, min(model_need_mib, device.total_mib) - device.free_mib)
 
 
 def _ollama_base_url() -> str:
@@ -748,9 +792,11 @@ def optimize_model(
 
     Seed from the GGUF and hardware; unless ``quick``, sweep with ``llama-bench``, then launch the winner as a real
     server. A failed validation steps down once (ctx, then ``ngl``); if that fails too the unmeasured seed is saved.
-    ``quick`` saves the unmeasured seed without launching anything. The profile is stored in ``cfg`` under
-    ``profile_key(digest, final_ctx)`` (and also under the requested ctx when that differs, so a lookup by the
-    requested ctx finds it); the config is written (a write failure is logged, never raised).
+    Ctrl-C (during the sweep or the validation) skips or abandons the validation and saves the best result so far with
+    ``validated=False``. The seed budgets the free VRAM (see :func:`optimize_seed`). ``quick`` saves the unmeasured
+    seed without launching anything. The profile is stored in ``cfg`` under ``profile_key(digest, final_ctx)`` (and
+    also under the requested ctx when that differs, so a lookup by the requested ctx finds it); the config is
+    written (a write failure is logged, never raised).
 
     Args:
         model: The installed Ollama model.
@@ -777,7 +823,7 @@ def optimize_model(
     if model.blob_path is None or model.digest is None:
         raise ValueError(f"{model.name} has no model layer")
     info = read_gguf(model.blob_path)
-    seed = heuristic_seed(info, host, device, ctx)
+    seed = optimize_seed(info, host, device, ctx)  # budgets the free VRAM; the fingerprint keeps describing the card
     fingerprint = hardware.fingerprint(host, device, llamacpp.version(server_bin))
     profile = Profile(args=seed_to_args(seed), ctx=seed.ctx, fingerprint=fingerprint, timestamp=_now())
     if not quick:
@@ -801,12 +847,21 @@ def optimize_model(
             run.run()
             profile.bench = _bench_table(run.results)
         winner = run.best_plan if run is not None and run.best is not None else seed
-        final = _validated(server_bin, model, cfg, device, winner, base)
+        interrupted = run is not None and run.interrupted
+        final: SeedPlan | None = winner  # an interrupted run launches nothing: the measured winner is kept as is
+        if not interrupted:
+            try:
+                final = _validated(server_bin, model, cfg, device, winner, base)
+            except KeyboardInterrupt:
+                interrupted = True
+                log.warning("Validation interrupted; keeping the measured winner without validating it")
+                final = winner
         if final is not None:
             result = run.measured(final) if run is not None else None
             profile.args, profile.ctx = seed_to_args(final), final.ctx
             if result is not None and result.tg_tps is not None:
                 profile.tg_tps, profile.pp_tps, profile.measured = result.tg_tps, result.pp_tps, True
+        profile.validated = not interrupted
     # The same profile is also reachable by the requested ctx, so `serve --ctx <requested>` finds it even when the
     # actual ctx (``profile.ctx``) was reduced to fit or by validation step-down.
     keys = list(dict.fromkeys([profile_key(model.digest, profile.ctx), profile_key(model.digest, ctx)]))

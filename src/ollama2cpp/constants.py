@@ -18,6 +18,9 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8080
 DEFAULT_CTX = 8192
 
+# --- Process exit codes ------------------------------------------------------
+EXIT_INTERRUPTED = 130  # the conventional exit code of a process ended by Ctrl-C
+
 # --- Environment variable names ----------------------------------------------
 ENV_OLLAMA_MODELS = "OLLAMA_MODELS"
 ENV_OLLAMA_MODEL = "OLLAMA_MODEL"

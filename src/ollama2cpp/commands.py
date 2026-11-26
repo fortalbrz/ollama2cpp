@@ -42,6 +42,7 @@ __all__ = [
     "run_status",
     "run_stop",
     "run_update",
+    "server_endpoint",
 ]
 
 logger = logging.getLogger(__name__)
@@ -54,6 +55,7 @@ _OLLAMA_MEDIA = "application/vnd.ollama.image."
 _UNSET_WORDS = frozenset({"", "none"})
 _MAX_PORT = 65535
 _UP_TO_DATE_MARKERS = ("no available upgrade", "no newer package")
+_NO_CHAT_HINT = "No chat model is installed; pull one first, e.g. `ollama pull llama3.2`."
 
 ConfigState = Literal["ok", "missing", "corrupt"]
 
@@ -67,10 +69,13 @@ def load_config(*, assume_yes: bool = False) -> Config:
     Args:
         assume_yes: Answer yes to the first-run installation question.
 
+    Only the commands that need a working setup (``optimize``) use this; the inspection commands use
+    :func:`peek_config` so they never install anything or write a configuration.
+
     Returns:
         Config: The saved configuration (never an unsaved per-run copy).
     """
-    cfg = config.load()
+    cfg = workflow.load_saved_config()
     return cfg if cfg is not None else workflow.ensure_config(workflow.ServeOptions(assume_yes=assume_yes))
 
 
@@ -89,7 +94,10 @@ def peek_config() -> tuple[Config | None, ConfigState]:
             shutil.copyfile(path, Path(tmp) / constants.CONFIG_FILENAME)
         except OSError:
             return None, "corrupt"
-        cfg = config.load(Path(tmp))
+        try:
+            cfg = config.load(Path(tmp))
+        except OSError:
+            return None, "corrupt"
     return (cfg, "ok") if cfg is not None else (None, "corrupt")
 
 
@@ -114,6 +122,23 @@ def models_root(cfg: Config | None) -> Path:
             "`ollama2cpp config --set ollama_path=<folder with manifests and blobs>`."
         )
     return found
+
+
+def server_endpoint(cfg: Config | None) -> tuple[str, int]:
+    """Return the ``(host, port)`` to probe for our own server: the one in its pid record, else the configured one.
+
+    A server started with ``serve --port 9000`` listens there whatever the configuration says.
+
+    Args:
+        cfg: The configuration, or None.
+
+    Returns:
+        tuple[str, int]: Address and port.
+    """
+    record = server.read_record(constants.home())
+    if record is not None:
+        return record.host, record.port
+    return (cfg.host, cfg.port) if cfg else (constants.DEFAULT_HOST, constants.DEFAULT_PORT)
 
 
 def find_server(cfg: Config | None) -> Path | None:
@@ -225,18 +250,24 @@ def run_list(*, as_json: bool = False) -> int:
         int: The exit code.
     """
     with ui.use_stderr() if as_json else contextlib.nullcontext():  # stdout carries only the JSON
-        cfg = load_config()
-        root = models_root(cfg)
-        device = pick_device(cfg, find_server(cfg))
+        saved, _ = peek_config()  # never a first run: no installation and no writes
+        cfg = saved or Config()
+        root = models_root(saved)
+        device = pick_device(saved, find_server(saved))  # without llama-server the fit shows "?"
         rows = [_list_row(c, cfg, device) for c in selector.classify_all(ollama.list_models(root), DEFAULT_CTX)]
+        hint = None if any(r["kind"] == "chat" for r in rows) else _NO_CHAT_HINT
+        if as_json and hint:
+            ui.show_notice("info", hint)
     if as_json:
         typer.echo(json.dumps(rows, indent=2))
         return 0
     if not rows:
-        ui.show_notice("warn", f"No Ollama models found in {root}.")
+        ui.show_notice("warn", f"No Ollama models found in {root}. {hint}")
         return 0
     columns = ["Name", "Size GiB", "Quant", "Arch", "Ctx", "Kind", "Fits VRAM", "Optimized", "Note"]
     ui.show_table(f"Ollama models in {root}", columns, [_table_cells(r) for r in rows])
+    if hint:
+        ui.show_notice("info", hint)
     return 0
 
 
@@ -294,12 +325,12 @@ def run_info(name: str) -> int:
     Returns:
         int: The exit code.
     """
-    cfg = load_config()
-    root = models_root(cfg)
+    saved, _ = peek_config()  # never a first run: no installation and no writes
+    root = models_root(saved)
     model = ollama.resolve_model(root, name)
     cand = selector.classify(model, DEFAULT_CTX)
-    device = pick_device(cfg, find_server(cfg))
-    ui.panel(model.name, "\n".join(_info_lines(cand, device, profiles_for(cfg, model.digest))))
+    device = pick_device(saved, find_server(saved))
+    ui.panel(model.name, "\n".join(_info_lines(cand, device, profiles_for(saved or Config(), model.digest))))
     blobs = root / "blobs"
     layers = [
         [
@@ -351,8 +382,7 @@ def run_status() -> int:
         int: The exit code.
     """
     cfg, state = peek_config()
-    host = cfg.host if cfg else constants.DEFAULT_HOST
-    port = cfg.port if cfg else constants.DEFAULT_PORT
+    host, port = server_endpoint(cfg)
     devices = hardware.detect_devices(find_server(cfg))
     lines = [f"Server       : {_server_line(host, port)}", f"Config       : {_config_line(state)}"]
     lines += [f"GPU          : {_free_text(d)}" for d in devices] or ["GPU          : none detected (CPU only)"]
@@ -490,7 +520,7 @@ def _tail(text: str, count: int = UPDATE_TAIL_LINES) -> str:
 
 def _refresh_paths() -> str:
     """Record the (possibly relocated) binaries in the saved configuration; return the new ``llama-server`` version."""
-    saved = config.load()
+    saved = workflow.load_saved_config()
     binary = llamacpp.find_binary("llama-server", saved.llama_server if saved else None)
     if binary is None:
         return "unknown"
@@ -602,14 +632,17 @@ def run_config(*, set_values: Sequence[str] = (), reset: bool = False, assume_ye
         raise WorkflowError("Use either --set or --reset, not both.")
     if reset:
         return _reset(assume_yes=assume_yes)
-    values = _parse_assignments(set_values)  # validated before first-run or any write
-    cfg = load_config()
+    values = _parse_assignments(set_values)  # validated before any write
     if values:
+        cfg = workflow.load_saved_config() or Config()  # a missing file is created; nothing is installed or probed
         for key, value in values.items():
             setattr(cfg, key, value)
         config.save(cfg)
         for key, value in values.items():
             ui.show_notice("ok", f"{key} = {value}")
+    elif peek_config()[1] == "missing":
+        ui.show_notice("info", f"{config.config_file()}: not configured yet - run `ollama2cpp` once to set up.")
+        return 0
     ui.show_notice("info", f"Config file: {config.config_file()}")
     typer.echo(config.config_file().read_text(encoding="utf-8").rstrip())
     return 0

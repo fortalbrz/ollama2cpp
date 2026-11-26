@@ -34,10 +34,14 @@ _CPU_ID_PREFIX = "CPU"
 _INTEGRATED_NAME_PATTERNS = (
     # AMD: "Radeon(TM) Graphics", "Radeon Graphics", "Radeon(TM) Vega 8 Graphics", "Radeon 780M Graphics".
     re.compile(r"\bRadeon(?:\(TM\))?\s+(?:(?:Vega\s+\d+|\d{3,4}M)\s+)?Graphics\b", re.IGNORECASE),
-    # Intel: "UHD Graphics", "Iris(R) Xe Graphics", "HD Graphics" (Arc is discrete and never matches).
+    # Intel: "UHD Graphics", "Iris(R) Xe Graphics", "HD Graphics".
     re.compile(r"\bIntel\b.*\b(?:UHD|Iris|HD)\b.*\bGraphics\b", re.IGNORECASE),
+    # Intel Core Ultra: "Intel(R) Graphics", "Intel(R) Arc(TM) Graphics", "Intel(R) Arc(TM) 140V GPU" (no A/B model).
+    re.compile(r"\bIntel(?:\(R\))?\s+Graphics\b", re.IGNORECASE),
+    re.compile(r"\bArc(?:\(TM\))?\s+(?:Graphics\b|\d{3}V\b)", re.IGNORECASE),
 )
-_DISCRETE_NAME_PATTERN = re.compile(r"\bArc\b", re.IGNORECASE)
+# Discrete Intel Arc names carry a model number: "Arc(TM) A770", "Arc(TM) B580", "Arc(TM) A370M", "Arc(TM) Pro A60".
+_DISCRETE_NAME_PATTERN = re.compile(r"\bArc(?:\(TM\))?\s+(?:Pro\s+)?[A-Z]\d{2,3}M?\b", re.IGNORECASE)
 
 # "  Vulkan0: NVIDIA GeForce RTX 5060 Ti (7891 MiB, 5198 MiB free)"; the free figure is optional.
 _DEVICE_LINE = re.compile(
@@ -98,8 +102,10 @@ def is_integrated(device: Device) -> bool:
 
     The guess is name-based and conservative. It flags AMD ``Radeon(TM) Graphics`` / ``Radeon Graphics`` /
     ``Radeon(TM) Vega N Graphics`` / ``Radeon 780M Graphics`` style names (no discrete model number) and Intel
-    ``UHD`` / ``Iris`` / ``HD`` Graphics. Intel Arc, NVIDIA, discrete Radeon (``RX ...``) and Apple/Metal GPUs
-    are never flagged. ``llama-server --list-devices`` prints no explicit integrated/UMA marker, so none is read.
+    ``UHD`` / ``Iris`` / ``HD`` Graphics, plus the Core Ultra iGPU names (``Intel(R) Graphics``,
+    ``Arc(TM) Graphics``, ``Arc(TM) 140V GPU``). Intel Arc names with a model number (``A770``, ``B580``,
+    ``Pro A60``), NVIDIA, discrete Radeon (``RX ...``) and Apple/Metal GPUs are never flagged.
+    ``llama-server --list-devices`` prints no explicit integrated/UMA marker, so none is read.
 
     Args:
         device: Device to classify.

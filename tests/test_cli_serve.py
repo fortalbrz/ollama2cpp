@@ -12,7 +12,7 @@ from typing import Any
 import pytest
 from typer.testing import CliRunner
 
-from ollama2cpp import config, constants, hardware, llamacpp, ollama, server
+from ollama2cpp import config, constants, gguf, hardware, llamacpp, ollama, selector, server
 from ollama2cpp.__main__ import app
 from ollama2cpp.hardware import Device, HostInfo
 from tests.gguf_builder import write_gguf
@@ -511,6 +511,63 @@ def test_already_running_same_model_exits_0(rig: Rig) -> None:
     assert rig.stops == []
 
 
+def test_already_running_same_model_hints_that_settings_may_differ(rig: Rig) -> None:
+    rig.save_config()
+    rig.running = ("ours", "big:latest")
+    result = rig.invoke("serve", "--ctx", "4096")
+    assert result.exit_code == 0, result.output
+    text = " ".join(result.output.split())
+    assert "already running" in text
+    assert "--restart" in text
+    assert "differ" in text
+    assert (rig.starts, rig.stops) == ([], [])
+
+
+def test_restart_same_model_stops_and_starts_again_with_the_new_settings(rig: Rig) -> None:
+    rig.save_config()
+    rig.running = ("ours", "big:latest")
+    result = rig.invoke("serve", "--restart", "--ctx", "4096")
+    assert result.exit_code == 0, result.output
+    assert rig.stops == [1]
+    (call,) = rig.starts
+    argv = call["argv"]
+    assert argv[argv.index("-c") + 1] == "4096"  # the new settings, not the old server's
+    assert call["model"] == "big:latest"
+
+
+def test_restart_same_model_picks_up_a_new_profile(rig: Rig) -> None:
+    cfg = rig.save_config()
+    model = rig.model("big")
+    assert model.digest is not None
+    cfg.profiles[config.profile_key(model.digest, 8192)] = config.Profile(
+        args=["-ngl", "7", "-t", "3"], ctx=8192, fingerprint=hardware.fingerprint(HOST, GPU, BUILD)
+    )
+    config.save(cfg)
+    rig.running = ("ours", "big:latest")
+    assert rig.invoke("serve", "--restart").exit_code == 0
+    argv = rig.starts[0]["argv"]
+    assert argv[argv.index("-ngl") + 1] == "7"
+
+
+def test_restart_same_model_waits_for_the_port(rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
+    rig.save_config()
+    rig.running = ("ours", "big:latest")
+    monkeypatch.setattr(server, "port_in_use", lambda _h, _p: True)
+    monkeypatch.setattr("ollama2cpp.workflow.PORT_FREE_TIMEOUT", 0.05)
+    result = rig.invoke("serve", "--restart")
+    assert result.exit_code == 1
+    assert "still in use" in result.output
+    assert rig.starts == []
+
+
+def test_restart_same_model_with_a_foreign_listener_still_refuses(rig: Rig) -> None:
+    rig.save_config()
+    rig.running = ("foreign", "big:latest")
+    result = rig.invoke("serve", "--restart")
+    assert result.exit_code == 1
+    assert (rig.stops, rig.starts) == ([], [])
+
+
 def test_running_other_model_exits_1_without_restart(rig: Rig) -> None:
     rig.save_config()
     rig.running = ("ours", "tiny:latest")
@@ -685,3 +742,220 @@ def test_serve_model_option_wins_over_group(rig: Rig) -> None:
     rig.save_config()
     result = rig.invoke("--model", "tiny", "serve", "--dry-run", "--model", "gemma4:12b")
     assert "--alias gemma4:12b" in _argv(result.output)
+
+
+# --- OLLAMA_MODEL naming a model that is not installed ---------------------------------------------------------------
+
+MISSING_ENV_MODEL = "qwen3.5:0.8b"
+
+
+def test_first_run_with_a_missing_env_model_falls_back_to_auto_select(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(constants.ENV_OLLAMA_MODEL, MISSING_ENV_MODEL)
+    result = rig.invoke("serve", "--dry-run", "--yes")
+    assert result.exit_code == 0, result.output
+    text = " ".join(result.output.split())
+    assert f"OLLAMA_MODEL={MISSING_ENV_MODEL} is not installed" in text
+    assert "auto-selected" in text
+    cfg = config.load()
+    assert cfg is not None
+    assert cfg.default_model == "big:latest"
+    assert "Traceback" not in result.output
+
+
+def test_bare_first_run_with_a_missing_env_model_works(rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(constants.ENV_OLLAMA_MODEL, MISSING_ENV_MODEL)
+    result = rig.invoke()
+    assert result.exit_code == 0, result.output
+    assert rig.starts[0]["model"] == "big:latest"
+
+
+def test_regular_run_with_a_missing_env_model_uses_the_saved_default(rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
+    rig.save_config(default_model="tiny:latest")
+    monkeypatch.setenv(constants.ENV_OLLAMA_MODEL, MISSING_ENV_MODEL)
+    result = rig.invoke("serve", "--dry-run")
+    assert result.exit_code == 0, result.output
+    text = " ".join(result.output.split())
+    assert f"OLLAMA_MODEL={MISSING_ENV_MODEL} is not installed" in text
+    assert "saved default" in text
+    assert "--alias tiny:latest" in _argv(result.output)
+
+
+def test_bare_regular_run_with_a_missing_env_model_uses_the_saved_default(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rig.save_config(default_model="tiny:latest")
+    monkeypatch.setenv(constants.ENV_OLLAMA_MODEL, MISSING_ENV_MODEL)
+    result = rig.invoke()
+    assert result.exit_code == 0, result.output
+    assert rig.starts[0]["model"] == "tiny:latest"
+
+
+def test_regular_run_with_a_missing_env_model_and_no_default_auto_selects(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rig.save_config(default_model=None)
+    monkeypatch.setenv(constants.ENV_OLLAMA_MODEL, MISSING_ENV_MODEL)
+    result = rig.invoke("serve", "--dry-run")
+    assert result.exit_code == 0, result.output
+    assert "auto-selected" in " ".join(result.output.split())
+    assert "--alias big:latest" in _argv(result.output)
+
+
+def test_env_model_that_is_installed_wins_over_the_saved_default(rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
+    rig.save_config()
+    monkeypatch.setenv(constants.ENV_OLLAMA_MODEL, "tiny")
+    result = rig.invoke("serve", "--dry-run")
+    assert result.exit_code == 0, result.output
+    assert "--alias tiny:latest" in _argv(result.output)
+    assert "not installed" not in result.output
+
+
+def test_model_flag_naming_a_missing_model_still_fails_even_with_the_env_set(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rig.save_config()
+    monkeypatch.setenv(constants.ENV_OLLAMA_MODEL, "tiny")
+    for args in (("serve", "--dry-run", "--model", "nope"), ("--model", "nope", "serve", "--dry-run")):
+        result = rig.invoke(*args)
+        assert result.exit_code == 1, args
+        assert "not found" in result.output
+        assert "Available" in result.output
+
+
+def test_model_flag_naming_a_missing_model_fails_on_a_first_run_too(rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(constants.ENV_OLLAMA_MODEL, "tiny")
+    result = rig.invoke("serve", "--dry-run", "--yes", "--model", "nope")
+    assert result.exit_code == 1
+    assert "not found" in result.output
+    assert config.load() is None
+
+
+# --- profile context and validation notices ---------------------------------------------------------------------
+
+
+def _save_profile(rig: Rig, *, ctx: int, keys: tuple[int, ...], **fields: Any) -> None:
+    cfg = rig.save_config()
+    model = rig.model("big")
+    assert model.digest is not None
+    profile = config.Profile(args=["-ngl", "7"], ctx=ctx, fingerprint=hardware.fingerprint(HOST, GPU, BUILD), **fields)
+    for key in keys:
+        cfg.profiles[config.profile_key(model.digest, key)] = profile
+    config.save(cfg)
+
+
+def test_profile_with_a_reduced_context_warns_about_the_difference(rig: Rig) -> None:
+    _save_profile(rig, ctx=2048, keys=(8192,))
+    result = rig.invoke("serve", "--dry-run")
+    assert result.exit_code == 0, result.output
+    text = " ".join(result.output.split())
+    assert "Using profile context 2048 instead of requested 8192" in text
+    assert "optimize --ctx 8192" in text
+    assert "--ctx 2048" in text
+    assert "-c 2048" in _argv(result.output)
+
+
+def test_profile_found_by_the_requested_key_warns_when_its_context_differs(rig: Rig) -> None:
+    _save_profile(rig, ctx=2048, keys=(2048, 4096))
+    result = rig.invoke("serve", "--dry-run", "--ctx", "4096")
+    assert "Using profile context 2048 instead of requested 4096" in " ".join(result.output.split())
+    assert "-c 2048" in _argv(result.output)
+
+
+def test_profile_found_by_the_actual_key_is_silent(rig: Rig) -> None:
+    _save_profile(rig, ctx=2048, keys=(2048, 4096))
+    result = rig.invoke("serve", "--dry-run", "--ctx", "2048")
+    assert result.exit_code == 0, result.output
+    assert "Using profile context" not in result.output
+    assert "-c 2048" in _argv(result.output)
+
+
+def test_profile_with_the_requested_context_is_silent(rig: Rig) -> None:
+    _save_profile(rig, ctx=8192, keys=(8192,))
+    assert "Using profile context" not in rig.invoke("serve", "--dry-run").output
+
+
+def test_unvalidated_profile_is_labelled(rig: Rig) -> None:
+    _save_profile(rig, ctx=8192, keys=(8192,), measured=True, tg_tps=33.0, validated=False)
+    result = rig.invoke("serve", "--dry-run")
+    assert result.exit_code == 0, result.output
+    text = " ".join(result.output.split())
+    assert "not validated (optimization was interrupted)" in text
+    assert "optimized profile" in text  # still used like a measured one
+    assert "-ngl 7" in _argv(result.output)
+
+
+def test_validated_profile_has_no_validation_notice(rig: Rig) -> None:
+    _save_profile(rig, ctx=8192, keys=(8192,), measured=True, tg_tps=33.0)
+    assert "not validated" not in rig.invoke("serve", "--dry-run").output
+
+
+# --- the low-VRAM warning compares against the need, not the file size ---------------------------------------
+
+
+def test_low_free_vram_warning_compares_with_the_need_at_the_chosen_ctx(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rig.save_config()
+    rig.host = HostInfo((Device("CUDA0", "Test GPU", 8192, 7123),), 32768, 16000, 8, 16)
+    # the 6 GiB manifest is smaller than the 7123 MiB free, but the real need (weights + KV + overhead) is not
+    assert rig.model("big").size // (1024 * 1024) < 7123
+    monkeypatch.setattr(selector, "estimate_need_mib", lambda *_a, **_k: 7544)
+    text = " ".join(rig.invoke("serve", "--dry-run").output.split())
+    assert "Only 7123 MiB of VRAM is free" in text
+    assert "7544 MiB" in text
+
+
+def test_no_low_free_vram_warning_when_the_need_fits(rig: Rig) -> None:
+    rig.save_config(default_model="tiny:latest")
+    rig.host = HostInfo((Device("CUDA0", "Test GPU", 8192, 7123),), 32768, 16000, 8, 16)
+    assert "of VRAM is free" not in rig.invoke("serve", "--dry-run").output
+
+
+def test_no_low_free_vram_warning_when_the_model_is_larger_than_the_card_but_the_card_is_free(rig: Rig) -> None:
+    rig.save_config(default_model="huge:latest")
+    rig.host = HostInfo((Device("CUDA0", "Test GPU", 8192, 8192),), 32768, 16000, 8, 16)
+    assert "of VRAM is free" not in rig.invoke("serve", "--dry-run").output
+
+
+# --- an unreadable (not corrupt) config -------------------------------------------------------------------------
+
+
+def test_unreadable_config_is_a_clean_error_and_the_file_stays(rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
+    rig.save_config()
+    path = config.config_file()
+    before = path.read_text(encoding="utf-8")
+    real_read_text = Path.read_text
+
+    def denied(self: Path, *args: Any, **kwargs: Any) -> str:
+        if self.name == constants.CONFIG_FILENAME:
+            msg = "denied"
+            raise PermissionError(msg)
+        return real_read_text(self, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "read_text", denied)
+        result = rig.invoke("serve", "--dry-run")
+    assert result.exit_code == 1
+    assert "Cannot read the configuration" in " ".join(result.output.split())
+    assert "Traceback" not in result.output
+    assert path.read_text(encoding="utf-8") == before
+    assert not path.with_name("config.json.bak").exists()
+    assert rig.installs == []  # no first run was started over the unreadable file
+
+
+def test_low_free_vram_warning_is_skipped_when_the_gguf_header_cannot_be_read(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _save_profile(rig, ctx=8192, keys=(8192,))  # a saved profile means serve itself never needs the header
+    rig.host = HostInfo((Device("CUDA0", "Busy GPU", 8192, 100),), 32768, 16000, 8, 16)
+
+    def unreadable(_path: Path) -> None:
+        msg = "bad header"
+        raise gguf.GgufError(msg)
+
+    monkeypatch.setattr(gguf, "read_gguf", unreadable)
+    result = rig.invoke("serve", "--dry-run")
+    assert result.exit_code == 0, result.output
+    assert "of VRAM is free" not in result.output

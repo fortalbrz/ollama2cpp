@@ -163,6 +163,16 @@ def test_best_device_override_honours_igpu() -> None:
         ("Intel(R) Iris(R) Xe Graphics", True),
         ("Intel(R) HD Graphics 630", True),
         ("Intel(R) Arc(TM) A770 Graphics", False),
+        ("Intel(R) Arc(TM) A380 Graphics", False),
+        ("Intel(R) Arc(TM) A370M Graphics", False),
+        ("Intel(R) Arc(TM) B580 Graphics", False),
+        ("Intel(R) Arc(TM) Pro A60", False),
+        ("Intel Arc B570", False),
+        ("Intel(R) Arc(TM) Graphics", True),  # Core Ultra iGPU: an Arc name without a model number
+        ("Intel(R) Arc(TM) 140V GPU (16GB)", True),
+        ("Intel(R) Arc(TM) 130V GPU", True),
+        ("Intel(R) Graphics", True),
+        ("Intel(R) Graphics [0x7d55]", True),
         ("NVIDIA GeForce RTX 5060 Ti", False),
         ("AMD Radeon RX 7900 XTX", False),
         ("AMD Radeon(TM) RX 6600 Graphics", False),
@@ -171,6 +181,24 @@ def test_best_device_override_honours_igpu() -> None:
 )
 def test_is_integrated_heuristic(name: str, expected: bool) -> None:
     assert is_integrated(Device("X0", name, 1000, 500)) is expected
+
+
+@pytest.mark.parametrize(
+    ("device_id", "expected"), [("Vulkan0", False), ("Vulkan1", True)], ids=["nvidia-discrete", "amd-integrated"]
+)
+def test_is_integrated_on_the_real_vulkan_fixture(device_id: str, expected: bool) -> None:
+    devices = {d.id: d for d in parse_list_devices(VULKAN_SAMPLE)}
+    assert is_integrated(devices[device_id]) is expected
+
+
+def test_is_integrated_on_the_real_nvidia_smi_fixture() -> None:
+    assert not any(is_integrated(d) for d in parse_nvidia_smi(NVIDIA_SAMPLE))
+
+
+def test_best_device_prefers_a_discrete_arc_over_the_core_ultra_igpu() -> None:
+    igpu = Device("Vulkan1", "Intel(R) Arc(TM) Graphics", 30000, 28000)
+    arc = Device("Vulkan0", "Intel(R) Arc(TM) B580 Graphics", 12000, 11000)
+    assert best_device([igpu, arc]) == arc
 
 
 def test_best_device_override_missing_falls_back_to_discrete() -> None:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -26,6 +27,7 @@ from ollama2cpp import (
     selector,
     server,
     ui,
+    workflow,
 )
 from ollama2cpp.__main__ import app
 from ollama2cpp.config import Profile
@@ -66,6 +68,9 @@ class Rig:
     ready: bool = True
     stops: list[int] = field(default_factory=list)
     updates: list[list[str]] = field(default_factory=list)
+    installs: list[bool] = field(default_factory=list)
+    first_runs: list[int] = field(default_factory=list)
+    describes: list[tuple[str, int]] = field(default_factory=list)
 
     def invoke(self, *args: str) -> Any:
         """Run the CLI."""
@@ -121,8 +126,20 @@ def rig(fake_ollama: Callable[..., Path], tmp_path: Path, monkeypatch: pytest.Mo
         return state.bench if state.bench_present else None
 
     def describe(host: str, port: int, base: Path | None = None) -> tuple[str, str | None]:
-        del host, port, base
+        del base
+        state.describes.append((host, port))
         return state.running
+
+    def install(*, assume_yes: bool = False) -> Path:
+        state.installs.append(assume_yes)
+        state.binary_present = True
+        return state.binary
+
+    real_first_run = workflow.first_run
+
+    def first_run(opts: workflow.ServeOptions) -> config.Config:
+        state.first_runs.append(1)
+        return real_first_run(opts)
 
     def stop(base: Path | None = None, **_kwargs: Any) -> bool:
         del base
@@ -137,9 +154,11 @@ def rig(fake_ollama: Callable[..., Path], tmp_path: Path, monkeypatch: pytest.Mo
         return proc.ProcResult(0, "Successfully installed\n", "")
 
     monkeypatch.setattr(llamacpp, "find_binary", find_binary)
+    monkeypatch.setattr(llamacpp, "install", install)
+    monkeypatch.setattr(workflow, "first_run", first_run)
     monkeypatch.setattr(llamacpp, "version", lambda _b: BUILD)
     monkeypatch.setattr(hardware, "host_info", lambda _b: _host(*state.devices))
-    monkeypatch.setattr(hardware, "detect_devices", lambda _b: list(state.devices))
+    monkeypatch.setattr(hardware, "detect_devices", lambda b: list(state.devices) if b is not None else [])
     monkeypatch.setattr(server, "describe_running", describe)
     monkeypatch.setattr(server, "is_ready", lambda _h, _p: state.ready)
     monkeypatch.setattr(server, "stop", stop)
@@ -222,7 +241,7 @@ def test_list_json_with_no_models_is_empty_array(rig: Rig, tmp_path: Path, monke
     rig.save_config(ollama_path=str(empty))
     result = rig.invoke("list", "--json")
     assert result.exit_code == 0, result.output
-    assert json.loads(result.output) == []
+    assert json.loads(result.stdout) == []
     assert "No Ollama models" in rig.invoke("list").output
 
 
@@ -258,15 +277,95 @@ def test_list_without_ollama_directory_exits_1(rig: Rig, monkeypatch: pytest.Mon
     assert "Traceback" not in result.output
 
 
-def test_list_runs_first_run_setup_when_unconfigured(rig: Rig) -> None:
+def test_list_never_runs_first_run_setup_or_installs(rig: Rig) -> None:
+    rig.binary_present = False  # no llama-server and no config: the old code ran winget here
     result = rig.invoke("list")
     assert result.exit_code == 0, result.output
-    cfg = config.load()
-    assert cfg is not None
-    assert cfg.default_model == BIG
+    assert (rig.installs, rig.first_runs) == ([], [])
+    assert not config.config_file().exists()
+    big = _rows(result.output)[BIG].replace("│", " ").split()
+    assert big[-2:] == ["?", "no"]  # without llama-server the fit cannot be told
+    assert BIG in result.output
+
+
+def test_list_with_llama_server_but_no_config_still_writes_nothing(rig: Rig) -> None:
+    result = rig.invoke("list")
+    assert result.exit_code == 0, result.output
+    assert (rig.installs, rig.first_runs) == ([], [])
+    assert not config.config_file().exists()
+    assert "yes" in _rows(result.output)[BIG]  # the GPU is detected through the binary that was found
+
+
+def test_list_json_never_installs_and_keeps_stdout_pure(rig: Rig) -> None:
+    rig.binary_present = False
+    result = rig.invoke("list", "--json")
+    assert result.exit_code == 0, result.output
+    assert len(json.loads(result.stdout)) == 7
+    assert (rig.installs, rig.first_runs) == ([], [])
+    assert not config.config_file().exists()
+    assert "First run" not in result.output
+
+
+def _store_with_only(rig: Rig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, keep: str | None) -> Path:
+    """Copy the fake store keeping only the manifest of ``keep`` (None keeps none) and point Ollama at it."""
+    root = tmp_path / "only"
+    shutil.copytree(rig.root, root)
+    for manifest in (root / "manifests").rglob("*"):
+        if manifest.is_file() and manifest.parent.name != keep:
+            manifest.unlink()
+    monkeypatch.setenv(constants.ENV_OLLAMA_MODELS, str(root))
+    return root
+
+
+def test_list_json_on_an_empty_store_is_an_empty_array(
+    rig: Rig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _store_with_only(rig, tmp_path, monkeypatch, None)
+    result = rig.invoke("list", "--json")
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout) == []
+    assert "ollama pull" in result.stderr  # the hint goes to stderr, stdout stays machine-readable
+    assert (rig.installs, rig.first_runs) == ([], [])
+    table = rig.invoke("list")
+    assert table.exit_code == 0, table.output
+    assert "ollama pull" in table.output
+
+
+def test_list_with_only_embedding_models_shows_them_and_hints(
+    rig: Rig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _store_with_only(rig, tmp_path, monkeypatch, "nomic-embed")
+    result = rig.invoke("list", "--json")
+    assert result.exit_code == 0, result.output
+    rows = json.loads(result.stdout)
+    assert [r["kind"] for r in rows] == ["embedding"]
+    assert "No chat model" in result.stderr
+    table = rig.invoke("list")
+    assert table.exit_code == 0, table.output
+    assert "embedding" in _rows(table.output)["nomic-embed:latest"]
+    assert "No chat model" in table.output
+    assert not config.config_file().exists()
+
+
+def test_list_does_not_rename_a_corrupt_config(rig: Rig) -> None:
+    path = config.config_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{not json", encoding="utf-8")
+    assert rig.invoke("list").exit_code == 0
+    assert path.read_text(encoding="utf-8") == "{not json"
+    assert (rig.installs, rig.first_runs) == ([], [])
 
 
 # --- info ----------------------------------------------------------------------------------------------------------
+
+
+def test_info_never_runs_first_run_setup_or_installs(rig: Rig) -> None:
+    rig.binary_present = False
+    result = rig.invoke("info", "big")
+    assert result.exit_code == 0, result.output
+    assert BIG in result.output
+    assert (rig.installs, rig.first_runs) == ([], [])
+    assert not config.config_file().exists()
 
 
 def test_info_unknown_model_exit_1(rig: Rig) -> None:
@@ -337,6 +436,30 @@ def test_status_none_ours_foreign(rig: Rig, running: tuple[str, str | None], exp
         assert "ready" in result.output
         rig.ready = False
         assert "still loading" in rig.invoke("status").output
+
+
+def _record(port: int, host: str = "127.0.0.1") -> server.ServerRecord:
+    return server.ServerRecord(pid=1, host=host, port=port, model=BIG, started="2026-11-25T10:00:00+00:00")
+
+
+def test_status_probes_the_host_and_port_of_the_pid_record(rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
+    rig.save_config()  # configured port 8080
+    monkeypatch.setattr(server, "read_record", lambda _base=None: _record(9000, "0.0.0.0"))
+    rig.running = ("ours", BIG)
+    result = rig.invoke("status")
+    assert result.exit_code == 0, result.output
+    assert rig.describes == [("0.0.0.0", 9000)]
+    assert "running (ours)" in result.output
+    assert "9000" in result.output
+
+
+def test_status_falls_back_to_the_configured_endpoint_without_a_record(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rig.save_config(port=8123)
+    monkeypatch.setattr(server, "read_record", lambda _base=None: None)
+    assert rig.invoke("status").exit_code == 0
+    assert rig.describes == [("127.0.0.1", 8123)]
 
 
 def test_status_warns_low_free_vram(rig: Rig) -> None:
@@ -490,6 +613,26 @@ def test_config_shows_path_and_json(rig: Rig) -> None:
     assert str(config.config_file()) in " ".join(result.output.split())
     body = result.output[result.output.index("{") :]
     assert json.loads(body)["default_model"] == BIG
+
+
+def test_config_without_a_config_file_says_so_and_writes_nothing(rig: Rig) -> None:
+    rig.binary_present = False
+    result = rig.invoke("config")
+    assert result.exit_code == 0, result.output
+    assert "not configured yet" in " ".join(result.output.split())
+    assert (rig.installs, rig.first_runs) == ([], [])
+    assert not config.config_file().exists()
+
+
+def test_config_set_without_a_config_file_creates_it_without_installing(rig: Rig) -> None:
+    rig.binary_present = False
+    result = rig.invoke("config", "--set", "port=9000")
+    assert result.exit_code == 0, result.output
+    assert (rig.installs, rig.first_runs) == ([], [])
+    cfg = config.load()
+    assert cfg is not None
+    assert cfg.port == 9000
+    assert cfg.llama_server is None  # nothing was discovered or installed on the side
 
 
 def test_config_set_and_reset(rig: Rig, tmp_path: Path) -> None:
@@ -803,15 +946,26 @@ def test_optimize_all_failing_everywhere_exits_1(rig: Rig, opt: OptimizeRig) -> 
     assert opt.optimized == [BIG, "huge:latest", TINY]
 
 
-def test_optimize_all_refuses_the_models_that_do_not_fit(rig: Rig, opt: OptimizeRig) -> None:
+def test_optimize_all_runs_models_larger_than_the_card_as_partial_offload(rig: Rig, opt: OptimizeRig) -> None:
     rig.devices = [FULL_GPU]
     rig.save_config()
     result = rig.invoke("optimize", "--all")
     assert result.exit_code == 0, result.output
-    assert "huge:latest" in result.output
-    assert "short by" in result.output
-    assert BIG in opt.optimized
-    assert "huge:latest" not in opt.optimized
+    text = " ".join(result.output.split())
+    assert "does not fit this GPU entirely" in text
+    assert "offloaded partially" in text
+    assert "Something else" not in text  # nobody is blamed for a model that is simply too big
+    assert sorted(opt.optimized) == sorted([BIG, TINY, "huge:latest"])
+
+
+def test_optimize_all_refuses_the_models_that_do_not_fit_what_is_left(rig: Rig, opt: OptimizeRig) -> None:
+    rig.devices = [Device("CUDA0", "Test GPU", 8192, 3000)]
+    rig.save_config()
+    result = rig.invoke("optimize", "--all")
+    assert result.exit_code == 0, result.output  # tiny still fits the 3000 MiB that are free
+    assert "5192 MiB of VRAM is in use by other processes" in " ".join(result.output.split())
+    assert opt.optimized == [TINY]
+    assert "fail" in _rows(result.output)[BIG]
 
 
 def test_optimize_ctrl_c_saves_best_so_far(rig: Rig, opt: OptimizeRig) -> None:
@@ -926,15 +1080,6 @@ def test_optimize_all_without_chat_models_is_an_error(rig: Rig, opt: OptimizeRig
 # --- review fixes: machine output, refusal logging, OLLAMA_MODEL --------------------------------------------------
 
 
-def test_list_json_first_run_keeps_stdout_pure(rig: Rig) -> None:
-    result = rig.invoke("list", "--json")
-    assert result.exit_code == 0, result.output
-    assert len(json.loads(result.stdout)) == 7  # stdout is only the JSON array
-    assert "First run" in result.stderr  # the setup messages are not swallowed
-    assert "First run" not in result.stdout
-    assert config.config_file().is_file()
-
-
 def test_list_json_with_unsupported_models_keeps_stdout_pure(rig: Rig) -> None:
     rig.save_config()
     result = rig.invoke("list", "--json")
@@ -1006,3 +1151,274 @@ def test_optimize_all_with_an_explicit_model_flag_still_conflicts(
     assert result.exit_code == 1
     assert "Give either a MODEL or --all, not both." in result.output
     assert opt.optimized == []
+
+
+# --- optimize: VRAM pre-flight rule, partial offload, interrupts, targets before stops ------------------------------
+
+
+def _need(rig: Rig, name: str) -> int:
+    return selector.classify(rig.model(name)).need_mib
+
+
+def test_optimize_proceeds_when_only_a_desktop_sized_chunk_is_held(rig: Rig, opt: OptimizeRig) -> None:
+    # the real host: 7891 MiB card, ~770 MiB held by the desktop, a model that needs a bit less than the whole card
+    rig.devices = [Device("CUDA0", "Test GPU", 7891, 7123)]
+    rig.save_config()
+    assert 7123 < _need(rig, BIG) < 7891
+    result = rig.invoke("optimize", "big")
+    assert result.exit_code == 0, result.output
+    text = " ".join(result.output.split())
+    assert "Free VRAM is 7123 MiB of 7891 MiB; optimizing for what is free" in text
+    assert opt.benches  # the benchmark ran
+    assert opt.unloads == []
+    profile = _profile_for(BIG, rig)
+    assert profile is not None
+    assert profile.measured
+
+
+def test_optimize_refuses_when_others_hold_a_lot_and_names_the_amount(rig: Rig, opt: OptimizeRig) -> None:
+    rig.devices = [Device("CUDA0", "Test GPU", 7891, 3000)]
+    rig.save_config()
+    result = rig.invoke("optimize", "big")
+    assert result.exit_code == 1
+    text = " ".join(result.output.split())
+    assert "4891 MiB of VRAM is in use by other processes" in text
+    assert "--unload-ollama" in text
+    assert opt.benches == []
+    assert opt.optimized == []
+
+
+def test_optimize_tolerance_boundary(rig: Rig, opt: OptimizeRig) -> None:
+    rig.save_config()
+    tol = optimize_cmd.HOLD_TOLERANCE_MIB
+    assert tol == 1024
+    rig.devices = [Device("CUDA0", "Test GPU", 8192, 8192 - tol)]  # held exactly the tolerance: still proceeds
+    assert rig.invoke("optimize", "huge", "--quick").exit_code == 0
+    assert rig.invoke("optimize", "huge").exit_code == 0
+    rig.devices = [Device("CUDA0", "Test GPU", 8192, 8192 - tol - 1)]  # one MiB more: refused
+    refused = rig.invoke("optimize", "huge")
+    assert refused.exit_code == 1
+    assert "in use by other processes" in refused.output
+
+
+def test_optimize_model_larger_than_the_card_proceeds_as_partial_offload(rig: Rig, opt: OptimizeRig) -> None:
+    rig.devices = [FULL_GPU]
+    rig.save_config()
+    assert _need(rig, "huge") > FULL_GPU.total_mib
+    result = rig.invoke("optimize", "huge")
+    assert result.exit_code == 0, result.output
+    text = " ".join(result.output.split())
+    assert "does not fit this GPU entirely" in text
+    assert "layers will be offloaded partially" in text
+    assert "--unload-ollama" not in text
+    assert opt.benches
+    profile = _profile_for("huge:latest", rig)
+    assert profile is not None
+
+
+def test_optimize_with_the_unload_flag_still_asks_ollama_first(rig: Rig, opt: OptimizeRig) -> None:
+    rig.devices = [Device("CUDA0", "Test GPU", 7891, 7123)]  # a small hold would be tolerated, the user asked anyway
+    opt.free_after_unload = Device("CUDA0", "Test GPU", 7891, 7800)
+    rig.save_config()
+    result = rig.invoke("optimize", "big", "--unload-ollama")
+    assert result.exit_code == 0, result.output
+    assert opt.unloads == [1]
+    assert "optimizing for what is free" not in result.output  # the unload freed enough
+
+
+# --- optimize: Ctrl-C -------------------------------------------------------------------------------------------
+
+
+def test_optimize_interrupt_saves_an_unvalidated_profile_and_says_so(
+    rig: Rig, opt: OptimizeRig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rig.devices = [FULL_GPU]
+    rig.save_config()
+    validations: list[int] = []
+    monkeypatch.setattr(optimizer, "validate", lambda *_a, **_k: validations.append(1) or True)
+
+    def script(n: int) -> BenchResult:
+        if n == 2:
+            raise KeyboardInterrupt
+        return BenchResult(("-n", str(n)), 20.0, 100.0)
+
+    opt.bench_script = script
+    result = rig.invoke("optimize", "tiny")
+    assert result.exit_code == 0, result.output
+    assert validations == []  # no real server was started after Ctrl-C
+    profile = _profile_for(TINY, rig)
+    assert profile is not None
+    assert profile.measured
+    assert profile.validated is False
+    assert "Interrupted" in result.output
+    assert "not validated" in " ".join(result.output.split())
+
+
+def test_optimize_all_stops_after_an_interrupted_model(rig: Rig, opt: OptimizeRig) -> None:
+    rig.devices = [FULL_GPU]
+    rig.save_config()
+
+    def script(n: int) -> BenchResult:
+        if n == 2:
+            raise KeyboardInterrupt
+        return BenchResult(("-n", str(n)), 20.0, 100.0)
+
+    opt.bench_script = script
+    result = rig.invoke("optimize", "--all")
+    assert result.exit_code == 0, result.output  # the first model got a (partial) profile
+    assert len(opt.optimized) == 1  # the remaining models were never touched
+    assert "Interrupted" in result.output
+    saved = [name for name in (BIG, TINY, "huge:latest") if _profile_for(name, rig) is not None]
+    assert saved == opt.optimized
+
+
+def test_optimize_all_interrupted_before_anything_is_saved_exits_130(
+    rig: Rig, opt: OptimizeRig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rig.save_config()
+    calls: list[str] = []
+
+    def interrupted(model: ollama.OllamaModel, *_a: Any, **_k: Any) -> Profile:
+        calls.append(model.name)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(optimizer, "optimize_model", interrupted)
+    result = rig.invoke("optimize", "--all", "--quick")
+    assert result.exit_code == 130
+    assert len(calls) == 1
+    assert "Interrupted" in result.output
+
+
+# --- optimize: targets are resolved before anything is stopped -------------------------------------------------
+
+
+def test_optimize_unknown_model_with_stop_server_leaves_our_server_running(rig: Rig, opt: OptimizeRig) -> None:
+    rig.devices = [FULL_GPU]
+    rig.running = ("ours", BIG)
+    rig.save_config()
+    result = rig.invoke("optimize", "typo", "--stop-server")
+    assert result.exit_code == 1
+    assert "not found" in result.output
+    assert rig.stops == []  # the user's server was not stopped for a model that does not exist
+    assert rig.running == ("ours", BIG)
+
+
+def test_optimize_non_chat_model_with_stop_server_leaves_our_server_running(rig: Rig, opt: OptimizeRig) -> None:
+    rig.running = ("ours", BIG)
+    rig.save_config()
+    result = rig.invoke("optimize", "nomic-embed", "--stop-server")
+    assert result.exit_code == 1
+    assert rig.stops == []
+
+
+def test_optimize_probes_the_endpoint_of_the_pid_record(
+    rig: Rig, opt: OptimizeRig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rig.devices = [FULL_GPU]
+    rig.save_config()  # configured port 8080, but our server was started with --port 9000
+    monkeypatch.setattr(server, "read_record", lambda _base=None: _record(9000))
+    rig.running = ("ours", BIG)
+    result = rig.invoke("optimize", "tiny")
+    assert result.exit_code == 1
+    assert "--stop-server" in result.output
+    assert ("127.0.0.1", 9000) in rig.describes
+    assert ("127.0.0.1", 8080) not in rig.describes
+    assert opt.benches == []  # the benchmark never ran while our server holds the VRAM
+
+
+# --- OLLAMA_MODEL naming a model that is not installed (optimize) -------------------------------------------------
+
+
+def test_optimize_with_a_missing_env_model_uses_the_saved_default(
+    rig: Rig, opt: OptimizeRig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(constants.ENV_OLLAMA_MODEL, "qwen3.5:0.8b")
+    rig.save_config(default_model=TINY)
+    result = rig.invoke("optimize", "--quick")
+    assert result.exit_code == 0, result.output
+    assert "OLLAMA_MODEL=qwen3.5:0.8b is not installed" in " ".join(result.output.split())
+    assert opt.optimized == [TINY]
+
+
+def test_optimize_with_a_missing_env_model_and_no_default_auto_selects(
+    rig: Rig, opt: OptimizeRig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(constants.ENV_OLLAMA_MODEL, "qwen3.5:0.8b")
+    rig.save_config(default_model=None)
+    result = rig.invoke("optimize", "--quick")
+    assert result.exit_code == 0, result.output
+    assert "not installed" in result.output
+    assert opt.optimized == [BIG]
+
+
+def test_optimize_with_a_missing_env_model_on_a_first_run_works(
+    rig: Rig, opt: OptimizeRig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(constants.ENV_OLLAMA_MODEL, "qwen3.5:0.8b")
+    result = rig.invoke("optimize", "--quick", "--yes")
+    assert result.exit_code == 0, result.output
+    assert opt.optimized == [BIG]
+    assert config.load() is not None
+
+
+def test_optimize_model_argument_that_is_missing_still_fails_with_the_env_set(
+    rig: Rig, opt: OptimizeRig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(constants.ENV_OLLAMA_MODEL, TINY)
+    rig.save_config()
+    for args in (("optimize", "nope", "--quick"), ("--model", "nope", "optimize", "--quick")):
+        result = rig.invoke(*args)
+        assert result.exit_code == 1, args
+        assert "not found" in result.output
+    assert opt.optimized == []
+
+
+# --- an unreadable (not corrupt) config -------------------------------------------------------------------------
+
+
+def test_optimize_with_an_unreadable_config_fails_cleanly_and_moves_nothing(
+    rig: Rig, opt: OptimizeRig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rig.save_config()
+    before = config.config_file().read_text(encoding="utf-8")
+    real_read_text = Path.read_text
+
+    def denied(self: Path, *args: Any, **kwargs: Any) -> str:
+        if self.name == constants.CONFIG_FILENAME:
+            raise PermissionError("denied")
+        return real_read_text(self, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "read_text", denied)
+        result = rig.invoke("optimize", "tiny", "--quick")
+    assert result.exit_code == 1
+    assert "Cannot read the configuration" in " ".join(result.output.split())
+    assert "Traceback" not in result.output
+    assert config.config_file().read_text(encoding="utf-8") == before
+    assert not config.config_file().with_name("config.json.bak").exists()
+    assert rig.first_runs == []
+
+
+def test_optimize_on_a_cpu_only_host_runs_without_a_vram_check(rig: Rig, opt: OptimizeRig) -> None:
+    rig.devices = []
+    rig.save_config()
+    result = rig.invoke("optimize", "tiny")
+    assert result.exit_code == 0, result.output
+    assert opt.optimized == [TINY]
+
+
+def test_status_reports_a_config_that_cannot_be_read_without_touching_it(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rig.save_config()
+    before = config.config_file().read_text(encoding="utf-8")
+
+    def denied(_base: Path | None = None) -> None:
+        msg = "denied"
+        raise PermissionError(msg)
+
+    monkeypatch.setattr(config, "load", denied)
+    result = rig.invoke("status")
+    assert result.exit_code == 0, result.output
+    assert "unreadable or invalid" in result.output
+    assert config.config_file().read_text(encoding="utf-8") == before

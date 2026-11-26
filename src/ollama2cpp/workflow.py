@@ -23,6 +23,7 @@ __all__ = [
     "WorkflowError",
     "ensure_config",
     "first_run",
+    "load_saved_config",
     "plan_serve",
     "probe",
     "run_serve",
@@ -46,12 +47,14 @@ class ServeOptions:
 
     Attributes:
         model: Model name for this run (and the stored default on a first run).
+        model_from_env: ``model`` came from ``$OLLAMA_MODEL`` rather than the command line: when it is not installed
+            the run falls back to the saved default (or an automatic choice) with a warning instead of failing.
         ollama_path: Explicit Ollama models directory.
         host: Listen address override.
         port: Listen port override.
         ctx: Requested context size override.
         detach: Run in the background and return once ready.
-        restart: Replace our own running server when it serves another model.
+        restart: Stop and start our own running server again, also when it already serves this model.
         dry_run: Print the command instead of starting anything.
         vision: Pass the model's multimodal projector (``--mmproj``) when it has one.
         assume_yes: Answer yes to confirmation questions.
@@ -59,6 +62,7 @@ class ServeOptions:
     """
 
     model: str | None = None
+    model_from_env: bool = False
     ollama_path: Path | None = None
     host: str | None = None
     port: int | None = None
@@ -109,6 +113,21 @@ def probe(llama_server: Path, override: str | None) -> tuple[HostInfo, Device | 
     """
     host = hardware.host_info(llama_server)
     return host, hardware.best_device(host.devices, override)
+
+
+def load_saved_config() -> Config | None:
+    """Load the saved configuration (a corrupt file is backed up and reads as missing).
+
+    Returns:
+        Config | None: The configuration, or None when there is none.
+
+    Raises:
+        WorkflowError: When the file exists but cannot be read (nothing is moved or rewritten).
+    """
+    try:
+        return config.load()
+    except OSError as exc:
+        raise WorkflowError(f"Cannot read the configuration {config.config_file()}: {exc}") from exc
 
 
 def _require_server(cfg: Config) -> Path:
@@ -291,11 +310,20 @@ def first_run(opts: ServeOptions) -> Config:
     _ensure_binaries(cfg, opts)
     root, _ = _resolve_root(cfg, opts, first=True)
     cfg.ollama_path = str(root)
+    model: OllamaModel | None = None
+    reason = "requested with --model"
     if opts.model:
-        model, reason = ollama.resolve_model(root, opts.model), "requested with --model"
-        _require_blob(model)
-    else:
+        try:
+            model = ollama.resolve_model(root, opts.model)
+        except ollama.ModelNotFoundError:
+            if not opts.model_from_env:
+                raise
+        else:
+            _require_blob(model)
+    if model is None:
         model, reason = _auto_select(cfg, root)
+        if opts.model:
+            _warn_env_model_missing(opts.model, f"the auto-selected model ({model.name})")
     cfg.default_model = model.name
     config.save(cfg)
     ui.panel(
@@ -323,7 +351,7 @@ def _setup(opts: ServeOptions) -> tuple[Config, bool]:
         tuple[Config, bool]: The configuration to run with and whether it matches the saved one (False when a
             per-run ``--ollama-path`` replaced the models directory, so nothing derived from it may be saved).
     """
-    cfg = config.load()
+    cfg = load_saved_config()
     if cfg is None:
         return first_run(opts), True
     changed = _ensure_binaries(cfg, opts)
@@ -354,11 +382,18 @@ def ensure_config(opts: ServeOptions) -> Config:
     return _setup(opts)[0]
 
 
+def _warn_env_model_missing(name: str, fallback: str) -> None:
+    """Tell the user that ``$OLLAMA_MODEL`` names a model that is not installed and what is used instead."""
+    ui.show_notice("warn", f"{constants.ENV_OLLAMA_MODEL}={name} is not installed; falling back to {fallback}.")
+
+
 def select_model(cfg: Config, opts: ServeOptions, *, persist: bool = True) -> OllamaModel:
     """Resolve the model to serve: ``--model``, else the saved default, else a fresh automatic choice.
 
     A saved default that is no longer installed is replaced (with a notice) and the config is updated. A
-    ``--model`` given on a regular run is not saved.
+    ``--model`` given on a regular run is not saved. A model that came from ``$OLLAMA_MODEL`` (``model_from_env``)
+    and is not installed only warns and falls back to the saved default, then to an automatic choice; a model given
+    on the command line that is missing is an error.
 
     Args:
         cfg: The configuration.
@@ -368,16 +403,32 @@ def select_model(cfg: Config, opts: ServeOptions, *, persist: bool = True) -> Ol
 
     Returns:
         OllamaModel: The model.
+
+    Raises:
+        ModelNotFoundError: A command-line model is not installed.
     """
     root = _require_root(cfg)
+    missing_from_env: str | None = None
     if opts.model:
-        return ollama.resolve_model(root, opts.model)
+        try:
+            return ollama.resolve_model(root, opts.model)
+        except ollama.ModelNotFoundError:
+            if not opts.model_from_env:
+                raise
+            missing_from_env = opts.model
     if cfg.default_model:
         try:
-            return ollama.resolve_model(root, cfg.default_model)
+            model = ollama.resolve_model(root, cfg.default_model)
         except ollama.ModelNotFoundError:
-            ui.show_notice("warn", f"Default model {cfg.default_model} is no longer installed; choosing another.")
+            if missing_from_env is None:
+                ui.show_notice("warn", f"Default model {cfg.default_model} is no longer installed; choosing another.")
+        else:
+            if missing_from_env is not None:
+                _warn_env_model_missing(missing_from_env, f"the saved default ({model.name})")
+            return model
     model, reason = _auto_select(cfg, root)
+    if missing_from_env is not None:
+        _warn_env_model_missing(missing_from_env, f"the auto-selected model ({model.name})")
     ui.show_notice("info", f"Selected {model.name}: {reason}")
     if persist:
         cfg.default_model = model.name
@@ -432,6 +483,16 @@ def _choose_profile(
         current = hardware.fingerprint(host, device, llamacpp.version(_require_server(cfg)))
         if profile.fingerprint != current:
             warnings.append("The saved profile is stale (hardware or llama.cpp changed); re-run `ollama2cpp optimize`.")
+        if profile.ctx != requested:
+            warnings.append(
+                f"Using profile context {profile.ctx} instead of requested {requested} "
+                f"(re-run `ollama2cpp optimize --ctx {requested}` or pass --ctx {profile.ctx} to silence)."
+            )
+        if not profile.validated:
+            warnings.append(
+                "The saved profile was not validated (optimization was interrupted); "
+                "re-run `ollama2cpp optimize` to finish it."
+            )
         if profile.measured and profile.tg_tps is not None:
             note = f"Using optimized profile (tg {profile.tg_tps:.1f} t/s)"
         else:
@@ -447,6 +508,32 @@ def _choose_profile(
         warnings.append(f"Context reduced from {requested} to {seed.ctx} tokens to fit the available memory.")
     note = "No optimized profile for this model/context; using a heuristic seed (run `ollama2cpp optimize` to tune it)"
     return optimizer.seed_to_args(seed), seed.ctx, note, warnings
+
+
+def _low_vram_warning(model: OllamaModel, blob: Path, device: Device | None, ctx: int) -> str | None:
+    """Warn when less VRAM is free than the model needs at ``ctx`` (a model larger than the card needs the whole card).
+
+    Args:
+        model: The model being served.
+        blob: Its GGUF blob.
+        device: Chosen GPU, or None.
+        ctx: The context the server will run with.
+
+    Returns:
+        str | None: The warning, or None when there is no GPU, the free figure is unknown, or the model fits.
+    """
+    if device is None or device.free_mib <= 0:
+        return None
+    try:
+        need = selector.estimate_need_mib(model, gguf.read_gguf(blob), ctx)
+    except gguf.GgufError:
+        return None
+    if optimizer.vram_preflight(need, device) <= 0:
+        return None
+    return (
+        f"Only {device.free_mib} MiB of VRAM is free but the model needs about {need} MiB at context {ctx}; "
+        "another process (e.g. Ollama) may be holding it."
+    )
 
 
 def plan_serve(cfg: Config, opts: ServeOptions, model: OllamaModel) -> ServePlan:
@@ -468,11 +555,9 @@ def plan_serve(cfg: Config, opts: ServeOptions, model: OllamaModel) -> ServePlan
         cfg, model, digest, blob, opts.ctx or constants.DEFAULT_CTX, host, device
     )
     pinned = device.id if device is not None and (cfg.device or len(host.devices) > 1) else None
-    if device is not None and 0 < device.free_mib < model.size // _MIB:
-        warnings.append(
-            f"Only {device.free_mib} MiB of VRAM is free but the model is {model.size // _MIB} MiB; "
-            "another process (e.g. Ollama) may be holding it."
-        )
+    low_vram = _low_vram_warning(model, blob, device, ctx)
+    if low_vram:
+        warnings.append(low_vram)
     mmproj = None
     if opts.vision:
         mmproj = _projector(model, blob)
@@ -537,17 +622,22 @@ def _handle_running(model: OllamaModel, opts: ServeOptions, host: str, port: int
             "which is never stopped. Pick another port with --port."
         )
     url = f"http://{host}:{port}"
-    if alias is not None and ollama.normalize_name(alias) == model.name:
-        ui.show_notice("ok", f"llama-server is already running {model.name} at {url}.")
-        return 0
+    same = alias is not None and ollama.normalize_name(alias) == model.name
     if not opts.restart:
+        if same:
+            ui.show_notice("ok", f"llama-server is already running {model.name} at {url}.")
+            ui.show_notice(
+                "info", "Its settings may differ from the current profile or options; use --restart to apply them."
+            )
+            return 0
         ui.show_notice(
             "warn",
             f"ollama2cpp is already serving {alias or 'another model'} at {url}; "
             f"use --restart to replace it with {model.name}.",
         )
         return 1
-    ui.show_notice("info", f"Stopping the running server ({alias}) to start {model.name}.")
+    verb = "Restarting" if same else "Stopping"
+    ui.show_notice("info", f"{verb} the running server ({alias}) to start {model.name}.")
     server.stop(constants.home())
     _wait_port_free(host, port)
     return None

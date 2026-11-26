@@ -34,6 +34,7 @@ class Profile:
     fingerprint: dict[str, str] = field(default_factory=dict)
     timestamp: str = ""
     bench: list[dict[str, Any]] = field(default_factory=list)
+    validated: bool = True  # False when the optimizer was interrupted before launching a real server with it
 
 
 @dataclass
@@ -125,6 +126,9 @@ def _profile_from_dict(data: object) -> Profile:
     timestamp = data.get("timestamp", "")
     if not isinstance(timestamp, str):
         raise _InvalidConfigError("timestamp")
+    validated = data.get("validated", True)  # files written before this field existed were validated
+    if not isinstance(validated, bool):
+        raise _InvalidConfigError("validated")
     return Profile(
         args=list(args),
         ctx=_int(data, "ctx"),
@@ -134,6 +138,7 @@ def _profile_from_dict(data: object) -> Profile:
         fingerprint=dict(fingerprint),
         timestamp=timestamp,
         bench=list(bench),
+        validated=validated,
     )
 
 
@@ -183,7 +188,9 @@ def _back_up(path: Path) -> None:
 def load(base: Path | None = None) -> Config | None:
     """Load the config.
 
-    A corrupt or schema-invalid file is moved to ``config.json.bak`` and treated as absent.
+    A corrupt or schema-invalid file is moved to ``config.json.bak`` and treated as absent. A failure to *read* the
+    file (permissions, a locked file...) says nothing about its content, so the ``OSError`` propagates and the file
+    stays put.
 
     Args:
         base: Storage directory; ``None`` resolves ``constants.home()`` at call time.
@@ -196,7 +203,7 @@ def load(base: Path | None = None) -> Config | None:
         return None
     try:
         cfg = _config_from_dict(json.loads(path.read_text(encoding="utf-8")))
-    except (OSError, ValueError) as exc:  # ValueError covers JSON, unicode and schema errors
+    except ValueError as exc:  # JSON, unicode and schema errors (a read OSError is not corruption and propagates)
         log.warning("Config %s is unreadable or invalid (%s)", path, exc)
         log.debug("Config load failure details", exc_info=True)
         if path.is_file():

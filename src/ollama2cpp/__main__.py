@@ -16,7 +16,7 @@ from typing import Annotated
 import typer
 
 from ollama2cpp import __version__, commands, optimize_cmd, ui, workflow
-from ollama2cpp.constants import ENV_OLLAMA_MODEL
+from ollama2cpp.constants import ENV_OLLAMA_MODEL, EXIT_INTERRUPTED
 from ollama2cpp.llamacpp import LlamaCppError
 from ollama2cpp.ollama import ModelNotFoundError
 
@@ -31,6 +31,7 @@ class _State:
     verbose: bool = False
     model: str | None = None
     model_explicit: str | None = None  # the model from a `--model` flag, not from the environment
+    model_from_env: bool = False  # `model` came from $OLLAMA_MODEL
 
 
 _state = _State()
@@ -63,16 +64,14 @@ def _configure(
     _state.verbose = verbose
     _state.model = model
     source = ctx.get_parameter_source("model")
-    _state.model_explicit = None if source is not None and source.name == "ENVIRONMENT" else model
+    _state.model_from_env = model is not None and source is not None and source.name == "ENVIRONMENT"
+    _state.model_explicit = None if _state.model_from_env else model
     logging.basicConfig(
         level=logging.INFO if verbose else logging.WARNING,
         format="%(levelname)s %(name)s: %(message)s",
     )
     if ctx.invoked_subcommand is None:
-        _finish(lambda: workflow.run_serve(workflow.ServeOptions(model=model)))
-
-
-EXIT_INTERRUPTED = 130
+        _finish(lambda: workflow.run_serve(workflow.ServeOptions(model=model, model_from_env=_state.model_from_env)))
 
 
 def _finish(action: Callable[[], int]) -> None:
@@ -128,6 +127,7 @@ def serve(
     """Start llama-server on an Ollama model. Extra llama-server arguments go after `--`."""
     opts = workflow.ServeOptions(
         model=model or _state.model,
+        model_from_env=not model and _state.model_from_env,
         ollama_path=ollama_path,
         host=host,
         port=port,
@@ -223,6 +223,7 @@ def optimize(
     opts = optimize_cmd.OptimizeOptions(
         # `--all` ignores a model that only came from $OLLAMA_MODEL; an explicit MODEL or `--model` still conflicts
         model=model or (_state.model_explicit if all_models else _state.model),
+        model_from_env=not model and not all_models and _state.model_from_env,
         quick=quick,
         all_models=all_models,
         time_limit=time_limit,
