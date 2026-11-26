@@ -16,6 +16,7 @@ from ollama2cpp.hardware import (
     detect_devices,
     fingerprint,
     host_info,
+    is_integrated,
     parse_list_devices,
     parse_nvidia_smi,
 )
@@ -123,13 +124,57 @@ def test_parse_nvidia_smi_name_with_comma() -> None:
     assert devs == [Device("CUDA0", "Weird, Name", 100, 40)]
 
 
-def test_best_device_prefers_largest() -> None:
-    assert best_device([DGPU, IGPU]) == IGPU
+def test_best_device_prefers_discrete_over_larger_igpu() -> None:
+    assert best_device([DGPU, IGPU]) == DGPU
+    assert best_device([IGPU, DGPU]) == DGPU
+
+
+def test_best_device_real_fixture_picks_rtx_not_igpu() -> None:
+    chosen = best_device(parse_list_devices(VULKAN_SAMPLE))
+    assert chosen is not None
+    assert chosen.id == "Vulkan0"
+    assert chosen.name == "NVIDIA GeForce RTX 5060 Ti"
+
+
+def test_best_device_igpu_only_returns_igpu() -> None:
+    assert best_device([IGPU]) == IGPU
+    assert best_device([BIG_CPU_LIKE, IGPU]) == IGPU
+
+
+def test_best_device_largest_among_discrete() -> None:
+    small = Device("CUDA1", "NVIDIA GeForce RTX 3060", 12288, 12000)
+    big = Device("CUDA0", "NVIDIA GeForce RTX 4090", 24564, 23000)
+    assert best_device([small, IGPU, big]) == big
+
+
+def test_best_device_override_honours_igpu() -> None:
+    assert best_device([DGPU, IGPU], override="Vulkan1") == IGPU
     assert best_device([IGPU, DGPU], override="Vulkan0") == DGPU
 
 
-def test_best_device_override_missing_falls_back_to_largest() -> None:
-    assert best_device([DGPU, IGPU], override="CUDA9") == IGPU
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("AMD Radeon(TM) Graphics", True),
+        ("AMD Radeon Graphics", True),
+        ("AMD Radeon(TM) Vega 8 Graphics", True),
+        ("AMD Radeon 780M Graphics", True),
+        ("Intel(R) UHD Graphics 770", True),
+        ("Intel(R) Iris(R) Xe Graphics", True),
+        ("Intel(R) HD Graphics 630", True),
+        ("Intel(R) Arc(TM) A770 Graphics", False),
+        ("NVIDIA GeForce RTX 5060 Ti", False),
+        ("AMD Radeon RX 7900 XTX", False),
+        ("AMD Radeon(TM) RX 6600 Graphics", False),
+        ("Apple M2 Pro", False),
+    ],
+)
+def test_is_integrated_heuristic(name: str, expected: bool) -> None:
+    assert is_integrated(Device("X0", name, 1000, 500)) is expected
+
+
+def test_best_device_override_missing_falls_back_to_discrete() -> None:
+    assert best_device([DGPU, IGPU], override="CUDA9") == DGPU
 
 
 def test_best_device_never_picks_cpu() -> None:

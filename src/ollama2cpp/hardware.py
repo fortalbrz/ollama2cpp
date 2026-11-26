@@ -19,6 +19,7 @@ __all__ = [
     "detect_devices",
     "fingerprint",
     "host_info",
+    "is_integrated",
     "parse_list_devices",
     "parse_nvidia_smi",
 ]
@@ -28,6 +29,15 @@ log = logging.getLogger(__name__)
 PROBE_TIMEOUT_S = 30.0
 _BYTES_PER_MIB = 1024 * 1024
 _CPU_ID_PREFIX = "CPU"
+
+# Conservative integrated-GPU name heuristics (shared system memory, not VRAM). Apple/Metal is deliberately absent.
+_INTEGRATED_NAME_PATTERNS = (
+    # AMD: "Radeon(TM) Graphics", "Radeon Graphics", "Radeon(TM) Vega 8 Graphics", "Radeon 780M Graphics".
+    re.compile(r"\bRadeon(?:\(TM\))?\s+(?:(?:Vega\s+\d+|\d{3,4}M)\s+)?Graphics\b", re.IGNORECASE),
+    # Intel: "UHD Graphics", "Iris(R) Xe Graphics", "HD Graphics" (Arc is discrete and never matches).
+    re.compile(r"\bIntel\b.*\b(?:UHD|Iris|HD)\b.*\bGraphics\b", re.IGNORECASE),
+)
+_DISCRETE_NAME_PATTERN = re.compile(r"\bArc\b", re.IGNORECASE)
 
 # "  Vulkan0: NVIDIA GeForce RTX 5060 Ti (7891 MiB, 5198 MiB free)"; the free figure is optional.
 _DEVICE_LINE = re.compile(
@@ -83,6 +93,25 @@ def _is_cpu(device: Device) -> bool:
     return device.id.upper().startswith(_CPU_ID_PREFIX)
 
 
+def is_integrated(device: Device) -> bool:
+    """Guess whether a device is an integrated GPU that borrows system RAM instead of having its own VRAM.
+
+    The guess is name-based and conservative. It flags AMD ``Radeon(TM) Graphics`` / ``Radeon Graphics`` /
+    ``Radeon(TM) Vega N Graphics`` / ``Radeon 780M Graphics`` style names (no discrete model number) and Intel
+    ``UHD`` / ``Iris`` / ``HD`` Graphics. Intel Arc, NVIDIA, discrete Radeon (``RX ...``) and Apple/Metal GPUs
+    are never flagged. ``llama-server --list-devices`` prints no explicit integrated/UMA marker, so none is read.
+
+    Args:
+        device: Device to classify.
+
+    Returns:
+        bool: True when the name looks like an integrated GPU.
+    """
+    if _DISCRETE_NAME_PATTERN.search(device.name):
+        return False
+    return any(pattern.search(device.name) for pattern in _INTEGRATED_NAME_PATTERNS)
+
+
 def parse_list_devices(text: str) -> list[Device]:
     """Parse the output of ``llama-server --list-devices``.
 
@@ -110,7 +139,8 @@ def parse_list_devices(text: str) -> list[Device]:
 def parse_nvidia_smi(text: str) -> list[Device]:
     """Parse ``nvidia-smi --query-gpu=name,memory.total,memory.free --format=csv,noheader,nounits`` output.
 
-    Devices get ids ``CUDA0``, ``CUDA1``, ... by row position. Never raises: unparseable rows are skipped.
+    Devices get ids ``CUDA0``, ``CUDA1``, ... by row position (best-effort id, only used when ``--list-devices``
+    finds no GPU). Never raises: unparseable rows are skipped.
 
     Args:
         text: Command output, one ``name, total, free`` row per GPU.
@@ -175,17 +205,18 @@ def best_device(devices: Sequence[Device], override: str | None = None) -> Devic
 
     Args:
         devices: Candidate devices.
-        override: A device id that wins when it matches a non-CPU candidate.
+        override: A device id that wins when it matches a non-CPU candidate (even an integrated GPU).
 
     Returns:
-        Device | None: The override match, else the GPU with the most memory; None when there is no GPU.
+        Device | None: The override match, else the discrete GPU with the most memory. An integrated GPU is chosen
+            (largest first) only when it is the sole kind of GPU; None when there is no GPU.
     """
     gpus = [d for d in devices if not _is_cpu(d)]
     if override is not None:
         for device in gpus:
             if device.id == override:
                 return device
-    return max(gpus, key=lambda d: d.total_mib, default=None)
+    return max(gpus, key=lambda d: (not is_integrated(d), d.total_mib), default=None)
 
 
 def host_info(llama_server: Path | None) -> HostInfo:
