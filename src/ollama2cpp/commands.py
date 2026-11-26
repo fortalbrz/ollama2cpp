@@ -7,6 +7,7 @@ The optimizer command lives in :mod:`ollama2cpp.optimize_cmd`.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import shutil
@@ -223,10 +224,11 @@ def run_list(*, as_json: bool = False) -> int:
     Returns:
         int: The exit code.
     """
-    cfg = load_config()
-    root = models_root(cfg)
-    device = pick_device(cfg, find_server(cfg))
-    rows = [_list_row(c, cfg, device) for c in selector.classify_all(ollama.list_models(root), DEFAULT_CTX)]
+    with ui.use_stderr() if as_json else contextlib.nullcontext():  # stdout carries only the JSON
+        cfg = load_config()
+        root = models_root(cfg)
+        device = pick_device(cfg, find_server(cfg))
+        rows = [_list_row(c, cfg, device) for c in selector.classify_all(ollama.list_models(root), DEFAULT_CTX)]
     if as_json:
         typer.echo(json.dumps(rows, indent=2))
         return 0

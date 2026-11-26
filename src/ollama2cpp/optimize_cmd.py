@@ -196,7 +196,8 @@ def _optimize_one(
         profile = _optimize(cand, cfg, host, device, opts)
         seed = optimizer.heuristic_seed(cand.gguf, host, device, opts.ctx or DEFAULT_CTX) if cand.gguf else None
     except Exception as exc:
-        logger.warning("Optimizing %s failed", name, exc_info=True)
+        logger.warning("Optimizing %s failed: %s", name, exc)
+        logger.debug("Optimizing %s failed", name, exc_info=True)
         ui.show_notice("error", f"{name}: {exc}")
         return _Outcome(name, error=str(exc))
     return _Outcome(name, profile, seed)

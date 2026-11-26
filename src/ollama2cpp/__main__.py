@@ -30,6 +30,7 @@ class _State:
 
     verbose: bool = False
     model: str | None = None
+    model_explicit: str | None = None  # the model from a `--model` flag, not from the environment
 
 
 _state = _State()
@@ -61,6 +62,8 @@ def _configure(
         raise typer.Exit(code=0)
     _state.verbose = verbose
     _state.model = model
+    source = ctx.get_parameter_source("model")
+    _state.model_explicit = None if source is not None and source.name == "ENVIRONMENT" else model
     logging.basicConfig(
         level=logging.INFO if verbose else logging.WARNING,
         format="%(levelname)s %(name)s: %(message)s",
@@ -218,7 +221,8 @@ def optimize(
 ) -> None:
     """Find the fastest llama-server settings for a model on this machine and save them."""
     opts = optimize_cmd.OptimizeOptions(
-        model=model or _state.model,
+        # `--all` ignores a model that only came from $OLLAMA_MODEL; an explicit MODEL or `--model` still conflicts
+        model=model or (_state.model_explicit if all_models else _state.model),
         quick=quick,
         all_models=all_models,
         time_limit=time_limit,

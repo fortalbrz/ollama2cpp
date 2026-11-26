@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -920,3 +921,88 @@ def test_optimize_all_without_chat_models_is_an_error(rig: Rig, opt: OptimizeRig
     result = rig.invoke("optimize", "--all", "--quick")
     assert result.exit_code == 1
     assert "No chat models" in result.output
+
+
+# --- review fixes: machine output, refusal logging, OLLAMA_MODEL --------------------------------------------------
+
+
+def test_list_json_first_run_keeps_stdout_pure(rig: Rig) -> None:
+    result = rig.invoke("list", "--json")
+    assert result.exit_code == 0, result.output
+    assert len(json.loads(result.stdout)) == 7  # stdout is only the JSON array
+    assert "First run" in result.stderr  # the setup messages are not swallowed
+    assert "First run" not in result.stdout
+    assert config.config_file().is_file()
+
+
+def test_list_json_with_unsupported_models_keeps_stdout_pure(rig: Rig) -> None:
+    rig.save_config()
+    result = rig.invoke("list", "--json")
+    assert result.exit_code == 0, result.output
+    assert {r["kind"] for r in json.loads(result.stdout)} == {"chat", "embedding", "unsupported"}
+
+
+def test_use_stderr_routes_messages_and_restores_the_console(capsys: pytest.CaptureFixture[str]) -> None:
+    with ui.use_stderr():
+        ui.show_notice("info", "to stderr")
+    ui.show_notice("info", "to stdout")
+    out, err = capsys.readouterr()
+    assert "to stderr" in err
+    assert "to stderr" not in out
+    assert "to stdout" in out
+    assert ui.console.stderr is False
+
+
+def _fail_inside_stderr_block() -> None:
+    with ui.use_stderr():
+        msg = "boom"
+        raise RuntimeError(msg)
+
+
+def test_use_stderr_restores_the_console_after_an_error() -> None:
+    with pytest.raises(RuntimeError):
+        _fail_inside_stderr_block()
+    assert ui.console.stderr is False
+
+
+def test_optimize_refusal_logs_no_traceback(rig: Rig, opt: OptimizeRig, caplog: pytest.LogCaptureFixture) -> None:
+    rig.devices = [BUSY_GPU]
+    rig.save_config()
+    with caplog.at_level(logging.DEBUG, logger="ollama2cpp"):
+        result = rig.invoke("optimize", "--all")
+    assert result.exit_code == 1
+    ours = [r for r in caplog.records if r.name.startswith("ollama2cpp")]
+    loud = [r for r in ours if r.levelno >= logging.WARNING]
+    assert any("Optimizing big:latest failed" in r.getMessage() for r in loud)  # one line per failure...
+    assert all(r.exc_info is None for r in loud)  # ...and never a stack trace at WARNING or above
+    assert any(r.exc_info for r in ours if r.levelno == logging.DEBUG)  # the details stay available with --verbose
+
+
+def test_optimize_all_ignores_a_model_from_the_environment(
+    rig: Rig, opt: OptimizeRig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(constants.ENV_OLLAMA_MODEL, "tiny")
+    rig.save_config()
+    result = rig.invoke("optimize", "--all", "--quick")
+    assert result.exit_code == 0, result.output
+    assert sorted(opt.optimized) == sorted([BIG, TINY, "huge:latest"])
+
+
+def test_optimize_uses_the_model_from_the_environment(
+    rig: Rig, opt: OptimizeRig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(constants.ENV_OLLAMA_MODEL, "tiny")
+    rig.save_config()
+    assert rig.invoke("optimize", "--quick").exit_code == 0
+    assert opt.optimized == [TINY]
+
+
+def test_optimize_all_with_an_explicit_model_flag_still_conflicts(
+    rig: Rig, opt: OptimizeRig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(constants.ENV_OLLAMA_MODEL, "tiny")
+    rig.save_config()
+    result = rig.invoke("--model", "big", "optimize", "--all", "--quick")
+    assert result.exit_code == 1
+    assert "Give either a MODEL or --all, not both." in result.output
+    assert opt.optimized == []

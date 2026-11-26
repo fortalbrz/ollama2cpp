@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import sys
-from collections.abc import Sequence
+from collections.abc import Generator, Sequence
 from typing import Literal
 
 from rich.console import Console
@@ -32,6 +33,7 @@ __all__ = [
     "show_table",
     "status_text",
     "steps_progress",
+    "use_stderr",
 ]
 
 Level = Literal["info", "ok", "warn", "error"]
@@ -151,3 +153,20 @@ def show_table(title: str, columns: Sequence[str], rows: Sequence[Sequence[str |
     for row in rows:
         table.add_row(*(cell if isinstance(cell, Text) else Text(cell) for cell in row))
     console.print(table)
+
+
+@contextlib.contextmanager
+def use_stderr() -> Generator[None]:
+    """Send every message, panel, prompt and progress display to stderr for the duration of the block.
+
+    Used by commands whose stdout is machine output (``list --json``), so notices stay visible without polluting it.
+
+    Yields:
+        None: Control to the caller; the console goes back to stdout afterwards.
+    """
+    previous = console.stderr
+    console.stderr = True
+    try:
+        yield
+    finally:
+        console.stderr = previous
