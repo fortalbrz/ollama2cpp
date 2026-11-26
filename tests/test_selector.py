@@ -25,10 +25,10 @@ MIB = 1024**2
 BUDGET_8GB = 8 * 1024
 
 
-def _chat(name: str, size: int, **kwargs: Any) -> Spec:
+def _chat(name: str, size: int, tag: str = "latest", **kwargs: Any) -> Spec:
     """Spec for a model whose manifest declares ``size`` bytes and whose blob is a tiny valid GGUF (small KV cache)."""
     opts: dict[str, Any] = {"n_layer": 2, **kwargs}
-    return (name, "latest", size, {"blob_writer": lambda path: write_gguf(path, **opts)})
+    return (name, tag, size, {"blob_writer": lambda path: write_gguf(path, **opts)})
 
 
 def _models(builder: Builder, specs: list[Spec], **kwargs: Any) -> list[OllamaModel]:
@@ -207,9 +207,20 @@ def test_embedding_never_chosen_even_if_largest(fake_ollama: Builder) -> None:
     assert best[0].model.name == "chat:latest"
 
 
-@pytest.mark.parametrize("name", ["lfm3-audio", "Whisper-large", "kokoro-tts", "my-speech-model"])
-def test_audio_names_unsupported(fake_ollama: Builder, name: str) -> None:
-    (model,) = _models(fake_ollama, [_chat(name, GB)])
+@pytest.mark.parametrize(
+    ("name", "tag"),
+    [
+        ("lfm3-audio", "2b"),
+        ("x-tts", "1b"),
+        ("Whisper-large", "latest"),
+        ("my_speech_model", "1"),
+        ("kokoro-tts", "latest"),
+        ("speech-to-text", "latest"),
+        ("model", "audio"),
+    ],
+)
+def test_audio_names_unsupported(fake_ollama: Builder, name: str, tag: str) -> None:
+    (model,) = _models(fake_ollama, [_chat(name, GB, tag)])
     cand = classify(model)
     assert cand.kind == "unsupported"
     assert "audio model" in cand.reason
@@ -237,3 +248,12 @@ def test_embedding_audio_name_is_embedding(fake_ollama: Builder) -> None:
 def test_only_audio_model_returns_none(fake_ollama: Builder) -> None:
     models = _models(fake_ollama, [_chat("lfm3-audio", GB)])
     assert choose_best(classify_all(models), 100_000) is None
+
+
+@pytest.mark.parametrize(
+    ("name", "tag"),
+    [("watts-chat", "7b"), ("scotts-model", "latest"), ("chat", "audiophile"), ("speechless", "latest")],
+)
+def test_substring_only_names_stay_chat(fake_ollama: Builder, name: str, tag: str) -> None:
+    (model,) = _models(fake_ollama, [_chat(name, GB, tag)])
+    assert classify(model).kind == "chat"

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import math
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal
@@ -29,8 +30,10 @@ OVERHEAD_MIB = 512  # fixed runtime overhead (CUDA/Vulkan context, scratch buffe
 #   whisper - speech-to-text models
 # The real store's audio model (lfm3-audio) reports the text backbone arch ``lfm3``, so it is caught by name instead.
 NON_LLM_ARCHITECTURES = frozenset({"clip", "mmproj", "whisper"})
-# Case-insensitive model-name substrings marking speech/audio models that llama-server cannot serve as text chat.
-NON_TEXT_NAME_PATTERNS = ("audio", "whisper", "tts", "speech")
+# Whole-token match (tokens split on any non-alphanumeric: ``-``, ``_``, ``.``, ``:``, ``/``) for names of speech/audio
+# models that llama-server cannot serve as text chat. Whole tokens, not substrings, so ``watts-chat`` or
+# ``chat:audiophile`` are not caught. Trade-off: a glued name such as ``kokorotts`` is no longer detected by name.
+NON_TEXT_NAME_RE = re.compile(r"(?<![a-z0-9])(?:audio|whisper|tts|speech)(?![a-z0-9])")
 _MIB = 1024 * 1024
 
 Kind = Literal["chat", "embedding", "unsupported"]
@@ -83,7 +86,7 @@ def _classify(model: OllamaModel, ctx: int) -> Candidate:
         return Candidate(model, info, "embedding", need)
     if info.architecture in NON_LLM_ARCHITECTURES:
         return _unsupported(model, f"non-LLM architecture {info.architecture!r} (not a text chat model)", info)
-    if any(pattern in name for pattern in NON_TEXT_NAME_PATTERNS):
+    if NON_TEXT_NAME_RE.search(name):
         return _unsupported(model, "audio model (not a text chat model)", info)
     return Candidate(model, info, "chat", need)
 
