@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -191,14 +193,69 @@ def test_first_run_invalid_ollama_path_warns_and_falls_back(rig: Rig, tmp_path: 
     result = rig.invoke("serve", "--dry-run", "--yes", "--ollama-path", str(bad))
     assert result.exit_code == 0, result.output
     assert "nowhere" in result.output
+    assert "ignoring" in result.output
     cfg = config.load()
     assert cfg is not None
     assert cfg.ollama_path == str(rig.root)
 
 
+def _second_store(rig: Rig) -> Path:
+    """Build a second fake Ollama store that contains only ``alt:latest``."""
+    other = rig.root.parent / "other-ollama"
+    digest = "sha256:" + hashlib.sha256(b"alt").hexdigest()
+    manifest = other / "manifests" / "registry.ollama.ai" / "library" / "alt" / "latest"
+    manifest.parent.mkdir(parents=True)
+    layer = {"mediaType": "application/vnd.ollama.image.model", "digest": digest, "size": 2 * GB}
+    manifest.write_text(json.dumps({"schemaVersion": 2, "layers": [layer]}), encoding="utf-8")
+    (other / "blobs").mkdir()
+    write_gguf(other / "blobs" / digest.replace(":", "-"), n_layer=2)
+    return other
+
+
 def test_first_run_explicit_ollama_path_used(rig: Rig) -> None:
-    result = rig.invoke("serve", "--dry-run", "--yes", "--ollama-path", str(rig.root))
+    other = _second_store(rig)
+    result = rig.invoke("serve", "--dry-run", "--yes", "--ollama-path", str(other))
     assert result.exit_code == 0, result.output
+    cfg = config.load()
+    assert cfg is not None
+    assert cfg.ollama_path == str(other)  # a first run saves the flag
+    assert cfg.default_model == "alt:latest"
+
+
+def test_regular_run_valid_flag_is_per_run(rig: Rig) -> None:
+    rig.save_config()
+    other = _second_store(rig)
+    result = rig.invoke("serve", "--dry-run", "--ollama-path", str(other))
+    assert result.exit_code == 0, result.output
+    assert "--alias alt:latest" in _argv(result.output)  # big:latest is absent there: chosen for this run only
+    assert str(other / "blobs") in result.output
+    cfg = config.load()
+    assert cfg is not None
+    assert cfg.ollama_path == str(rig.root)
+    assert cfg.default_model == "big:latest"
+
+
+def test_regular_run_invalid_flag_uses_configured_path(
+    rig: Rig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rig.save_config()
+    monkeypatch.setattr(ollama, "find_ollama_path", _no_ollama)  # discovery must not be needed
+    result = rig.invoke("serve", "--dry-run", "--ollama-path", str(tmp_path / "bogus"))
+    assert result.exit_code == 0, result.output
+    assert "bogus" in result.output
+    assert "ignoring" in result.output
+    assert str(rig.root / "blobs") in result.output
+    cfg = config.load()
+    assert cfg is not None
+    assert cfg.ollama_path == str(rig.root)
+
+
+def test_regular_run_invalid_flag_and_configured_gone_rediscovers(rig: Rig, tmp_path: Path) -> None:
+    rig.save_config(ollama_path=str(tmp_path / "moved-away"))
+    result = rig.invoke("serve", "--dry-run", "--ollama-path", str(tmp_path / "bogus"))
+    assert result.exit_code == 0, result.output
+    assert "ignoring" in result.output
+    assert "moved-away" in result.output
     cfg = config.load()
     assert cfg is not None
     assert cfg.ollama_path == str(rig.root)

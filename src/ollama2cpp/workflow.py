@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from ollama2cpp import config, constants, gguf, hardware, llamacpp, ollama, optimizer, proc, selector, server, ui
@@ -236,39 +236,41 @@ def _ensure_binaries(cfg: Config, opts: ServeOptions) -> bool:
     return changed
 
 
-def _ensure_root(cfg: Config, opts: ServeOptions) -> bool:
-    """Make sure the configured Ollama models directory exists, discovering it when needed.
+def _resolve_root(cfg: Config, opts: ServeOptions, *, first: bool) -> tuple[Path, bool]:
+    """Find the Ollama models directory for this run.
 
-    Order: ``--ollama-path``, the configured path, ``$OLLAMA_MODELS`` and the common locations.
+    Order: a valid ``--ollama-path``, the configured path (while it still holds ``manifests/``), then discovery
+    (``$OLLAMA_MODELS`` and the common locations). An invalid flag only warns.
 
     Args:
-        cfg: The configuration, updated in place.
-        opts: The serve options (``ollama_path`` is the explicit candidate).
+        cfg: The configuration (its ``ollama_path`` is the configured candidate).
+        opts: The serve options (``ollama_path`` is the flag).
+        first: Whether this is a first run, where the flag is saved.
 
     Returns:
-        bool: True when the configuration changed.
+        tuple[Path, bool]: The directory and whether it must be written to the config (the flag is per-run on a
+            regular run; a rediscovered path is saved).
 
     Raises:
         WorkflowError: When no Ollama models directory can be found.
     """
+    flag = opts.ollama_path
+    if flag is not None:
+        if (flag / "manifests").is_dir():
+            return flag, first
+        ui.show_notice("warn", f"--ollama-path {flag} has no manifests/, ignoring")
     configured = Path(cfg.ollama_path) if cfg.ollama_path else None
-    if opts.ollama_path is None and configured is not None and (configured / "manifests").is_dir():
-        return False
-    found = ollama.find_ollama_path(opts.ollama_path)
-    if opts.ollama_path is not None and found != opts.ollama_path:
-        ui.show_notice(
-            "warn", f"--ollama-path {opts.ollama_path} is not an Ollama models directory; searching instead."
-        )
+    if configured is not None and (configured / "manifests").is_dir():
+        return configured, False
+    found = ollama.find_ollama_path()
     if found is None:
         raise WorkflowError(
             "Could not find the Ollama models directory. Set OLLAMA_MODELS or pass --ollama-path "
             "(it is the folder that contains `manifests` and `blobs`)."
         )
-    if opts.ollama_path is None and configured is not None:
+    if configured is not None:
         ui.show_notice("warn", f"Ollama path {configured} no longer exists; using {found}.")
-    changed = cfg.ollama_path != str(found)
-    cfg.ollama_path = str(found)
-    return changed
+    return found, True
 
 
 def first_run(opts: ServeOptions) -> Config:
@@ -286,8 +288,8 @@ def first_run(opts: ServeOptions) -> Config:
     ui.show_notice("info", "First run: setting up ollama2cpp.")
     cfg = Config()
     _ensure_binaries(cfg, opts)
-    _ensure_root(cfg, opts)
-    root = _require_root(cfg)
+    root, _ = _resolve_root(cfg, opts, first=True)
+    cfg.ollama_path = str(root)
     if opts.model:
         model, reason = ollama.resolve_model(root, opts.model), "requested with --model"
         _require_blob(model)
@@ -310,11 +312,37 @@ def first_run(opts: ServeOptions) -> Config:
     return cfg
 
 
+def _setup(opts: ServeOptions) -> tuple[Config, bool]:
+    """Load or create the configuration and settle the paths for this run.
+
+    Args:
+        opts: The serve options.
+
+    Returns:
+        tuple[Config, bool]: The configuration to run with and whether it matches the saved one (False when a
+            per-run ``--ollama-path`` replaced the models directory, so nothing derived from it may be saved).
+    """
+    cfg = config.load()
+    if cfg is None:
+        return first_run(opts), True
+    changed = _ensure_binaries(cfg, opts)
+    root, update = _resolve_root(cfg, opts, first=False)
+    if update:
+        cfg.ollama_path = str(root)
+        changed = True
+    if changed:
+        config.save(cfg)
+    if str(root) != cfg.ollama_path:
+        return replace(cfg, ollama_path=str(root)), False
+    return cfg, True
+
+
 def ensure_config(opts: ServeOptions) -> Config:
     """Load the configuration, running the first-run setup when there is none, and repair what went stale.
 
     A missing or corrupt config file means a first run. Otherwise a vanished ``llama-server`` is reinstalled and a
-    vanished Ollama directory is rediscovered; changes are saved.
+    vanished Ollama directory is rediscovered (and saved). A valid ``--ollama-path`` on a regular run applies to
+    this run only: the returned copy carries it but the saved file keeps the configured path.
 
     Args:
         opts: The serve options.
@@ -322,17 +350,10 @@ def ensure_config(opts: ServeOptions) -> Config:
     Returns:
         Config: A configuration with ``llama_server`` and ``ollama_path`` set.
     """
-    cfg = config.load()
-    if cfg is None:
-        return first_run(opts)
-    changed = _ensure_binaries(cfg, opts)
-    changed = _ensure_root(cfg, opts) or changed
-    if changed:
-        config.save(cfg)
-    return cfg
+    return _setup(opts)[0]
 
 
-def select_model(cfg: Config, opts: ServeOptions) -> OllamaModel:
+def select_model(cfg: Config, opts: ServeOptions, *, persist: bool = True) -> OllamaModel:
     """Resolve the model to serve: ``--model``, else the saved default, else a fresh automatic choice.
 
     A saved default that is no longer installed is replaced (with a notice) and the config is updated. A
@@ -341,6 +362,8 @@ def select_model(cfg: Config, opts: ServeOptions) -> OllamaModel:
     Args:
         cfg: The configuration.
         opts: The serve options.
+        persist: Whether an automatic choice may be saved as the new default (False when the models directory is a
+            per-run override).
 
     Returns:
         OllamaModel: The model.
@@ -355,8 +378,9 @@ def select_model(cfg: Config, opts: ServeOptions) -> OllamaModel:
             ui.show_notice("warn", f"Default model {cfg.default_model} is no longer installed; choosing another.")
     model, reason = _auto_select(cfg, root)
     ui.show_notice("info", f"Selected {model.name}: {reason}")
-    cfg.default_model = model.name
-    config.save(cfg)
+    if persist:
+        cfg.default_model = model.name
+        config.save(cfg)
     return model
 
 
@@ -537,8 +561,8 @@ def run_serve(opts: ServeOptions) -> int:
     Returns:
         int: The process exit code.
     """
-    cfg = ensure_config(opts)
-    model = select_model(cfg, opts)
+    cfg, persist = _setup(opts)
+    model = select_model(cfg, opts, persist=persist)
     host, port = opts.host or cfg.host, opts.port or cfg.port
     if not opts.dry_run:
         early = _handle_running(model, opts, host, port)
