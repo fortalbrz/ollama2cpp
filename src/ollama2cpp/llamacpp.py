@@ -128,7 +128,7 @@ def find_binary(name: str, configured: str | None = None) -> Path | None:
     return _which(name) or _winget_glob(name)
 
 
-def _manual_instructions() -> str:
+def manual_instructions() -> str:
     """Build the manual installation hint for this platform.
 
     Returns:
@@ -155,10 +155,10 @@ def install(*, assume_yes: bool = False) -> Path:
             or the binary still cannot be found afterwards.
     """
     if not _is_windows():
-        msg = f"Automatic installation is only supported on Windows. {_manual_instructions()}"
+        msg = f"Automatic installation is only supported on Windows. {manual_instructions()}"
         raise LlamaCppError(msg)
     if not ui.confirm(f"Install llama.cpp with winget ({WINGET_ID})?", assume_yes=assume_yes):
-        msg = f"Installation declined. {_manual_instructions()}"
+        msg = f"Installation declined. {manual_instructions()}"
         raise LlamaCppError(msg)
     result = proc.run(
         [
@@ -174,11 +174,11 @@ def install(*, assume_yes: bool = False) -> Path:
     )
     if result.returncode != 0:
         reason = "winget is not available" if result.returncode == proc.RC_NOT_FOUND else "winget failed"
-        msg = f"{reason} (exit code {result.returncode}). {_manual_instructions()}"
+        msg = f"{reason} (exit code {result.returncode}). {manual_instructions()}"
         raise LlamaCppError(msg)
     found = find_binary("llama-server")
     if found is None:
-        msg = f"winget finished but llama-server was not found. {_manual_instructions()}"
+        msg = f"winget finished but llama-server was not found. {manual_instructions()}"
         raise LlamaCppError(msg)
     return found
 

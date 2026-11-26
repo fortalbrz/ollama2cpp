@@ -59,3 +59,24 @@ def test_show_command_does_not_wrap(captured):
     command = "llama-server -m " + "x" * 200
     ui.show_command(command)
     assert command in captured.getvalue()
+
+
+def test_confirm_passes_the_default_answer(monkeypatch):
+    seen = {}
+    monkeypatch.setattr("sys.stdin", _Tty())
+    monkeypatch.setattr(ui.Confirm, "ask", lambda *_a, **kwargs: seen.update(kwargs) or True)
+    assert ui.confirm("delete?", default=False) is True
+    assert seen["default"] is False
+
+
+def test_steps_progress_returns_progress():
+    assert isinstance(ui.steps_progress(), Progress)
+
+
+def test_show_table_prints_cells_as_plain_text(captured):
+    ui.show_table("Things", ["Name", "State"], [["[bold]x", ui.status_text("ok")], ["y", ui.status_text("fail")]])
+    out = captured.getvalue()
+    assert "Things" in out
+    assert "[bold]x" in out  # markup in a cell is not interpreted
+    assert "ok" in out
+    assert "fail" in out

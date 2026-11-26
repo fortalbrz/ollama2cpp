@@ -3,15 +3,36 @@
 from __future__ import annotations
 
 import sys
+from collections.abc import Sequence
 from typing import Literal
 
 from rich.console import Console
 from rich.panel import Panel
-from rich.progress import BarColumn, DownloadColumn, Progress, TextColumn, TimeRemainingColumn
+from rich.progress import (
+    BarColumn,
+    DownloadColumn,
+    Progress,
+    SpinnerColumn,
+    TextColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+)
 from rich.prompt import Confirm
+from rich.table import Table
 from rich.text import Text
 
-__all__ = ["Level", "confirm", "console", "panel", "progress", "show_command", "show_notice"]
+__all__ = [
+    "Level",
+    "confirm",
+    "console",
+    "panel",
+    "progress",
+    "show_command",
+    "show_notice",
+    "show_table",
+    "status_text",
+    "steps_progress",
+]
 
 Level = Literal["info", "ok", "warn", "error"]
 
@@ -37,19 +58,20 @@ def show_notice(level: Level, message: str) -> None:
     console.print(message, markup=False, highlight=False)
 
 
-def confirm(question: str, *, assume_yes: bool = False) -> bool:
+def confirm(question: str, *, assume_yes: bool = False, default: bool = True) -> bool:
     """Ask a yes/no question.
 
     Args:
         question: The question to show.
         assume_yes: Answer yes without asking.
+        default: The answer when the user just presses Enter (use False for destructive actions).
 
     Returns:
         bool: True when ``assume_yes`` is set or stdin is not a TTY, else the user's answer.
     """
     if assume_yes or not sys.stdin.isatty():
         return True
-    return Confirm.ask(question, console=console, default=True)
+    return Confirm.ask(question, console=console, default=default)
 
 
 def panel(title: str, body: str) -> None:
@@ -84,3 +106,48 @@ def progress() -> Progress:
         TimeRemainingColumn(),
         console=console,
     )
+
+
+def steps_progress() -> Progress:
+    """Build a progress display for work of unknown length (a spinner, a step counter and the elapsed time).
+
+    Returns:
+        Progress: A Rich progress instance, to be used as a context manager.
+    """
+    return Progress(
+        SpinnerColumn(),
+        TextColumn("[bold]{task.description}"),
+        TextColumn("{task.completed} candidates"),
+        TimeElapsedColumn(),
+        console=console,
+        transient=True,
+    )
+
+
+def status_text(level: Literal["ok", "warn", "fail"]) -> Text:
+    """Render a check status word in its severity colour.
+
+    Args:
+        level: One of ``ok``, ``warn`` or ``fail``.
+
+    Returns:
+        Text: The word, coloured green, yellow or red.
+    """
+    style = {"ok": "green", "warn": "yellow", "fail": "red"}[level]
+    return Text(level, style=style)
+
+
+def show_table(title: str, columns: Sequence[str], rows: Sequence[Sequence[str | Text]]) -> None:
+    """Print a table whose cells are plain text (Rich markup in cells is not interpreted).
+
+    Args:
+        title: Table title.
+        columns: Column headers.
+        rows: One sequence of cells per row; a ``Text`` cell keeps its own style.
+    """
+    table = Table(title=title, title_justify="left", header_style="bold")
+    for column in columns:
+        table.add_column(column, overflow="fold")
+    for row in rows:
+        table.add_row(*(cell if isinstance(cell, Text) else Text(cell) for cell in row))
+    console.print(table)

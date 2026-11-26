@@ -24,6 +24,7 @@ __all__ = [
     "ensure_config",
     "first_run",
     "plan_serve",
+    "probe",
     "run_serve",
     "select_model",
 ]
@@ -96,7 +97,7 @@ class ServePlan:
 # --- hardware and model selection ----------------------------------------------------------------------------------
 
 
-def _probe(llama_server: Path, override: str | None) -> tuple[HostInfo, Device | None]:
+def probe(llama_server: Path, override: str | None) -> tuple[HostInfo, Device | None]:
     """Probe the host and choose the device to run on.
 
     Args:
@@ -199,7 +200,7 @@ def _auto_select(cfg: Config, root: Path) -> tuple[OllamaModel, str]:
     Returns:
         tuple[OllamaModel, str]: The model and the reason line.
     """
-    host, device = _probe(_require_server(cfg), cfg.device)
+    host, device = probe(_require_server(cfg), cfg.device)
     cand, fits = _pick_best(root, host, device)
     hw = _hardware_line(host, device)
     if fits:
@@ -462,7 +463,7 @@ def plan_serve(cfg: Config, opts: ServeOptions, model: OllamaModel) -> ServePlan
     blob, digest = _require_blob(model)
     binary = _require_server(cfg)
     host_addr, port = opts.host or cfg.host, opts.port or cfg.port
-    host, device = _probe(binary, cfg.device)
+    host, device = probe(binary, cfg.device)
     args, ctx, note, warnings = _choose_profile(
         cfg, model, digest, blob, opts.ctx or constants.DEFAULT_CTX, host, device
     )

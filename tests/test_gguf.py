@@ -288,3 +288,12 @@ def test_string_array_missing_elements(tmp_path: Path) -> None:
     bad = pack_string("x.arr") + struct.pack("<I", T_ARRAY) + arr
     with pytest.raises(GgufError):
         read_gguf(_raw(tmp_path, pack_header([bad])))
+
+
+_FILE_TYPE_CASES = [(None, "?"), (0, "F32"), (1, "F16"), (7, "Q8_0"), (15, "Q4_K_M"), (18, "Q6_K"), (30, "IQ4_XS")]
+_FILE_TYPE_CASES += [(32, "BF16"), (38, "MXFP4"), (4, "ftype 4"), (99, "ftype 99")]
+
+
+@pytest.mark.parametrize(("file_type", "name"), _FILE_TYPE_CASES)
+def test_file_type_name(file_type: int | None, name: str) -> None:
+    assert gguf.file_type_name(file_type) == name

@@ -332,3 +332,26 @@ def kv_cache_bytes(info: GgufInfo, ctx: int, bytes_per_elem: float = 2.0) -> int
         ``block_count * 2 * ctx * head_count_kv * head_dim * bytes_per_elem`` as an int.
     """
     return int(info.block_count * 2 * ctx * info.head_count_kv * head_dim(info) * bytes_per_elem)
+
+
+# llama.cpp ``llama_ftype`` names by value; "-" marks retired numbers.
+_FTYPES = (
+    "F32 F16 Q4_0 Q4_1 - - - Q8_0 Q5_0 Q5_1 Q2_K Q3_K_S Q3_K_M Q3_K_L Q4_K_S Q4_K_M Q5_K_S Q5_K_M Q6_K "
+    "IQ2_XXS IQ2_XS Q2_K_S IQ3_XS IQ3_XXS IQ1_S IQ4_NL IQ3_S IQ3_M IQ2_S IQ2_M IQ4_XS IQ1_M BF16 "
+    "- - - TQ1_0 TQ2_0 MXFP4"
+)
+_FILE_TYPE_NAMES = {n: name for n, name in enumerate(_FTYPES.split()) if name != "-"}
+
+
+def file_type_name(file_type: int | None) -> str:
+    """Name a ``general.file_type`` value (the dominant quantisation of the file).
+
+    Args:
+        file_type: The value from the GGUF header, or None when the file has none.
+
+    Returns:
+        str: ``Q4_K_M``-style name, ``ftype N`` for an unknown value, ``?`` when absent.
+    """
+    if file_type is None:
+        return "?"
+    return _FILE_TYPE_NAMES.get(file_type, f"ftype {file_type}")

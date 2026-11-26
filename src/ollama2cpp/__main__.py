@@ -15,7 +15,7 @@ from typing import Annotated
 
 import typer
 
-from ollama2cpp import __version__, ui, workflow
+from ollama2cpp import __version__, commands, optimize_cmd, ui, workflow
 from ollama2cpp.constants import ENV_OLLAMA_MODEL
 from ollama2cpp.llamacpp import LlamaCppError
 from ollama2cpp.ollama import ModelNotFoundError
@@ -137,6 +137,98 @@ def serve(
         extra_args=tuple(ctx.args),
     )
     _finish(lambda: workflow.run_serve(opts))
+
+
+@app.command("list")
+def list_cmd(
+    as_json: Annotated[bool, typer.Option("--json", help="Print a JSON array instead of a table.")] = False,
+) -> None:
+    """List the installed Ollama models (kind, size, quantisation, fit, optimization state)."""
+    _finish(lambda: commands.run_list(as_json=as_json))
+
+
+@app.command()
+def info(model: Annotated[str, typer.Argument(help="Ollama model name.")]) -> None:
+    """Show the GGUF details, layers, VRAM need and saved profiles of a model."""
+    _finish(lambda: commands.run_info(model))
+
+
+@app.command()
+def status() -> None:
+    """Show the server state, configuration, GPU memory and the default model's profile."""
+    _finish(commands.run_status)
+
+
+@app.command()
+def stop() -> None:
+    """Stop the server started by ollama2cpp (never touches other processes)."""
+    _finish(commands.run_stop)
+
+
+@app.command()
+def doctor() -> None:
+    """Check llama.cpp, Ollama, the GPU and the configuration, with fix hints."""
+    _finish(commands.run_doctor)
+
+
+@app.command()
+def update() -> None:
+    """Upgrade llama.cpp with winget."""
+    _finish(commands.run_update)
+
+
+@app.command("config")
+def config_cmd(
+    set_values: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--set", metavar="KEY=VALUE", help=f"Set a key ({', '.join(commands.SETTABLE_KEYS)}); repeatable."
+        ),
+    ] = None,
+    reset: Annotated[bool, typer.Option("--reset", help="Delete the configuration file.")] = False,
+    yes: Annotated[bool, typer.Option("--yes", "-y", help="Do not ask before --reset.")] = False,
+) -> None:
+    """Show the configuration and its path; change settings with --set, or delete it with --reset."""
+    _finish(lambda: commands.run_config(set_values=set_values or [], reset=reset, assume_yes=yes))
+
+
+@app.command()
+def optimize(
+    model: Annotated[str | None, typer.Argument(help="Ollama model name (default: saved/auto).")] = None,
+    quick: Annotated[bool, typer.Option("--quick", help="Save the heuristic settings without benchmarking.")] = False,
+    all_models: Annotated[bool, typer.Option("--all", help="Optimize every chat model.")] = False,
+    time_limit: Annotated[
+        float, typer.Option("--time-limit", min=0, help="Benchmark budget per model, in seconds.")
+    ] = optimize_cmd.DEFAULT_TIME_LIMIT,
+    context: Annotated[
+        int | None, typer.Option("--ctx", min=1, help="Context size to optimize for (default 8192).")
+    ] = None,
+    allow_kv_quant: Annotated[
+        bool, typer.Option("--allow-kv-quant", help="Also try a q8_0 KV cache (may affect quality).")
+    ] = False,
+    unload_ollama: Annotated[
+        bool, typer.Option("--unload-ollama", help="Ask Ollama to unload its models if they hold the VRAM.")
+    ] = False,
+    stop_server: Annotated[
+        bool, typer.Option("--stop-server", help="Stop our running server first (it holds VRAM).")
+    ] = False,
+    yes: Annotated[
+        bool, typer.Option("--yes", "-y", help="Answer yes to questions (e.g. installing llama.cpp).")
+    ] = False,
+) -> None:
+    """Find the fastest llama-server settings for a model on this machine and save them."""
+    opts = optimize_cmd.OptimizeOptions(
+        model=model or _state.model,
+        quick=quick,
+        all_models=all_models,
+        time_limit=time_limit,
+        ctx=context,
+        allow_kv_quant=allow_kv_quant,
+        unload_ollama=unload_ollama,
+        stop_server=stop_server,
+        assume_yes=yes,
+    )
+    _finish(lambda: optimize_cmd.run_optimize(opts))
 
 
 @app.command("ver")
